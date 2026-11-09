@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -79,6 +80,83 @@ factorized_dims(int32_t world_size,
   return {dims[0], dims[1], dims[2]};
 }
 
+[[nodiscard]] auto
+extent_aware_dims(int32_t world_size,
+                  DecompositionMode mode,
+                  int64_3d global_extent) -> int32_3d {
+  if (global_extent.x <= 0 || global_extent.y <= 0 || global_extent.z <= 0) {
+    return factorized_dims(world_size, mode);
+  }
+
+  const auto ceil_div = [](int64_t n, int32_t parts) -> int64_t {
+    return (n + static_cast<int64_t>(parts) - 1) / static_cast<int64_t>(parts);
+  };
+
+  bool found = false;
+  int32_3d best{1, 1, 1};
+  long double best_surface = std::numeric_limits<long double>::infinity();
+  int best_split_penalty = 0;
+  int32_t best_py = 0;
+  int32_t best_pz = 0;
+
+  for (int32_t px = 1; px <= world_size; ++px) {
+    if (world_size % px != 0) {
+      continue;
+    }
+    if (mode != DecompositionMode::Brick && px != 1) {
+      continue;
+    }
+    const int32_t remaining = world_size / px;
+    for (int32_t py = 1; py <= remaining; ++py) {
+      if (remaining % py != 0) {
+        continue;
+      }
+      const int32_t pz = remaining / py;
+      if (mode == DecompositionMode::Slab && py != 1) {
+        continue;
+      }
+
+      const int64_t lx = ceil_div(global_extent.x, px);
+      const int64_t ly = ceil_div(global_extent.y, py);
+      const int64_t lz = ceil_div(global_extent.z, pz);
+      if (lx <= 0 || ly <= 0 || lz <= 0) {
+        continue;
+      }
+
+      long double surface = 0.0L;
+      if (px > 1) {
+        surface += 2.0L * static_cast<long double>(ly) * static_cast<long double>(lz);
+      }
+      if (py > 1) {
+        surface += 2.0L * static_cast<long double>(lx) * static_cast<long double>(lz);
+      }
+      if (pz > 1) {
+        surface += 2.0L * static_cast<long double>(lx) * static_cast<long double>(ly);
+      }
+
+      const int split_axes = (px > 1 ? 1 : 0) + (py > 1 ? 1 : 0) + (pz > 1 ? 1 : 0);
+      // Prefer pencil-like two-axis splits on ties: they avoid the uncoalesced X faces
+      // without adding a third exchange axis.
+      const int split_penalty = (split_axes == 2) ? 0 : (split_axes == 1 ? 1 : 2);
+
+      if (!found || surface < best_surface ||
+          (surface == best_surface &&
+           (split_penalty < best_split_penalty ||
+            (split_penalty == best_split_penalty &&
+             (pz > best_pz || (pz == best_pz && py > best_py)))))) {
+        found = true;
+        best = {px, py, pz};
+        best_surface = surface;
+        best_split_penalty = split_penalty;
+        best_py = py;
+        best_pz = pz;
+      }
+    }
+  }
+
+  return found ? best : factorized_dims(world_size, mode);
+}
+
 }  // namespace
 
 auto
@@ -95,6 +173,23 @@ ProcessGrid::make(int32_t world_size,
     return ProcessGrid{};
   }
   return ProcessGrid{factorized_dims(world_size, mode), mode};
+}
+
+auto
+ProcessGrid::make(int32_t world_size,
+                  DecompositionMode mode,
+                  int64_3d global_extent) -> ProcessGrid {
+  if (world_size <= 0) {
+    log::throw_with_log<std::invalid_argument>(
+        "carbon::ProcessGrid::make: world_size must be > 0 (got {})", world_size);
+    return ProcessGrid{};
+  }
+  if (mode == DecompositionMode::Custom) {
+    log::throw_with_log<std::invalid_argument>(
+        "carbon::ProcessGrid::make: Custom mode requires ProcessGrid::custom()");
+    return ProcessGrid{};
+  }
+  return ProcessGrid{extent_aware_dims(world_size, mode, global_extent), mode};
 }
 
 auto

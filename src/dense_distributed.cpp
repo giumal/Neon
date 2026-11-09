@@ -243,7 +243,19 @@ DenseDistributed::DenseDistributed(System system,
     : DenseDistributed() {
   const int world_size = resolve_world_size(system);
   const ProcessGrid pg =
-      world_size > 0 ? ProcessGrid::make(world_size, decomposition) : ProcessGrid{};
+      world_size > 0 ? ProcessGrid::make(world_size, decomposition, global_extent)
+                     : ProcessGrid{};
+  if (world_size > 0) {
+    const carbon::Distributed* distributed = system.distributed();
+    if (distributed == nullptr || distributed->world_rank() == 0) {
+      const int32_3d dims = pg.dims();
+      CARBON_LOG_INFO(
+          "DenseDistributed: process_grid={}x{}x{} (mode={}, world_size={}, "
+          "global_extent={}x{}x{})",
+          dims.x, dims.y, dims.z, static_cast<int>(decomposition), world_size, global_extent.x,
+          global_extent.y, global_extent.z);
+    }
+  }
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
                pg, block_override);
 }

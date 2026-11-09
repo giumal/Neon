@@ -1,0 +1,357 @@
+diff --git a/include/carbon/dist_transfer.h b/include/carbon/dist_transfer.h
+--- a/include/carbon/dist_transfer.h
++++ b/include/carbon/dist_transfer.h
+@@ -144,6 +144,10 @@
+   std::vector<DistOp> ops_{};
+   std::vector<size_t> first_elements_{};
+   std::vector<size_t> counts_{};
++  // Byte-typed views of first_elements_/counts_, precomputed at construction so
++  // operator() does not allocate or re-convert on every halo exchange.
++  std::vector<size_t> first_bytes_{};
++  std::vector<size_t> byte_counts_{};
+ };
+ 
+ template <typename T>
+@@ -160,6 +164,12 @@
+   ops_ = std::move(ops);
+   first_elements_ = std::move(first_elements);
+   counts_ = std::move(counts);
++  first_bytes_.resize(counts_.size());
++  byte_counts_.resize(counts_.size());
++  for (size_t i = 0; i < counts_.size(); ++i) {
++    first_bytes_[i] = first_elements_[i] * sizeof(T);
++    byte_counts_[i] = counts_[i] * sizeof(T);
++  }
+ }
+ 
+ template <typename T>
+diff --git a/include/carbon/dist_transfer.inl b/include/carbon/dist_transfer.inl
+--- a/include/carbon/dist_transfer.inl
++++ b/include/carbon/dist_transfer.inl
+@@ -58,14 +58,8 @@
+   if (counts_.empty()) {
+     return;
+   }
+-  std::vector<size_t> first_bytes(counts_.size());
+-  std::vector<size_t> byte_counts(counts_.size());
+-  for (size_t i = 0; i < counts_.size(); ++i) {
+-    first_bytes[i] = first_elements_[i] * sizeof(T);
+-    byte_counts[i] = counts_[i] * sizeof(T);
+-  }
+   dist_transfer_detail::run(system_, static_cast<void*>(buffer_[0].data()), peer_ranks_, ops_,
+-                            first_bytes, byte_counts, stream);
++                            first_bytes_, byte_counts_, stream);
+ }
+ 
+ }  // namespace carbon
+diff --git a/include/carbon/halo_distributed.h b/include/carbon/halo_distributed.h
+--- a/include/carbon/halo_distributed.h
++++ b/include/carbon/halo_distributed.h
+@@ -248,7 +248,7 @@
+     // genuine but contention-masked numerical drift, not just harness contention).
+     // @c fence_event_ is empty for single-GPU / no-halo layouts, where the whole
+     // block is skipped.
+-    if (!fence_event_.empty()) {
++    if (field_.dense().system().gpu_group().size() > 1U && !fence_event_.empty()) {
+       fence_event_.record(stream);
+       stream.wait_for_all(fence_event_);
+     }
+@@ -274,7 +274,7 @@
+ #endif
+ 
+         if (i + 1U < axis_passes_.size()) {
+-          if (!pass.fence_event.empty()) {
++          if (field_.dense().system().gpu_group().size() > 1U && !pass.fence_event.empty()) {
+             pass.fence_event.record(stream);
+             stream.wait_for_all(pass.fence_event);
+           }
+@@ -532,6 +532,7 @@
+   const auto& spans = dense.spans();
+   const auto& gpu_buffers = field_.gpu_buffers();
+   const size_t n_gpus = spans.size();
++  const bool multi_local_gpu = dense.system().gpu_group().size() > 1U;
+ 
+   // ---------- Phase 2: short-circuit on empty / no-halo layouts ----------
+   if (n_gpus == 0U) {
+@@ -795,7 +796,7 @@
+   // operator() skips the fence entirely. System::event() is non-const (it appends to
+   // the System's event history), and dense.system() is a const ref, so take a shallow
+   // System copy to allocate from.
+-  if (intra_.src_counts().size() > 0U) {
++  if (multi_local_gpu && intra_.src_counts().size() > 0U) {
+     System sys = dense.system();
+     fence_event_ = sys.event();
+   }
+@@ -814,6 +815,7 @@
+   using detail::halo_distributed_build::AxisSide;
+ 
+   const DenseDistributed& dense = field_.dense();
++  const bool multi_local_gpu = dense.system().gpu_group().size() > 1U;
+   const ProcessGrid& pg = dense.process_grid();
+   const auto& spans = dense.spans();
+   const auto& gpu_buffers = field_.gpu_buffers();
+@@ -1076,7 +1078,7 @@
+     pass.dist = dist.finalise(dense.system(), gpu_buffers);
+ #endif
+ 
+-    if (!pass.intra.src_counts().empty()) {
++    if (multi_local_gpu && !pass.intra.src_counts().empty()) {
+       System sys = dense.system();
+       pass.fence_event = sys.event();
+     }
+@@ -1093,7 +1095,7 @@
+   }
+ 
+   for (const AxisPass& pass : axis_passes_) {
+-    if (!pass.intra.src_counts().empty()) {
++    if (multi_local_gpu && !pass.intra.src_counts().empty()) {
+       System sys = dense.system();
+       fence_event_ = sys.event();
+       break;
+diff --git a/include/carbon/process_grid.h b/include/carbon/process_grid.h
+--- a/include/carbon/process_grid.h
++++ b/include/carbon/process_grid.h
+@@ -66,6 +66,18 @@
+        DecompositionMode mode) -> ProcessGrid;
+ 
+   /**
++   * Extent-aware auto-factorization: choose a grid that satisfies @p mode and minimises the
++   * per-rank halo surface for @p global_extent. Falls back to @ref make(world_size, mode) when
++   * @p global_extent has a non-positive axis or no valid factorization exists.
++   *
++   * @throws std::invalid_argument if @p world_size <= 0, or @p mode is @c Custom.
++   */
++  [[nodiscard]] static auto
++  make(int32_t world_size,
++       DecompositionMode mode,
++       int64_3d global_extent) -> ProcessGrid;
++
++  /**
+    * Build an exact @c (Px,Py,Pz) grid.
+    *
+    * @throws std::invalid_argument if @p world_size <= 0, any dimension is <= 0, or
+diff --git a/src/process_grid.cpp b/src/process_grid.cpp
+--- a/src/process_grid.cpp
++++ b/src/process_grid.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <limits>
+ #include <stdexcept>
+ #include <vector>
+ 
+@@ -79,6 +80,83 @@
+   return {dims[0], dims[1], dims[2]};
+ }
+ 
++[[nodiscard]] auto
++extent_aware_dims(int32_t world_size,
++                  DecompositionMode mode,
++                  int64_3d global_extent) -> int32_3d {
++  if (global_extent.x <= 0 || global_extent.y <= 0 || global_extent.z <= 0) {
++    return factorized_dims(world_size, mode);
++  }
++
++  const auto ceil_div = [](int64_t n, int32_t parts) -> int64_t {
++    return (n + static_cast<int64_t>(parts) - 1) / static_cast<int64_t>(parts);
++  };
++
++  bool found = false;
++  int32_3d best{1, 1, 1};
++  long double best_surface = std::numeric_limits<long double>::infinity();
++  int best_split_penalty = 0;
++  int32_t best_py = 0;
++  int32_t best_pz = 0;
++
++  for (int32_t px = 1; px <= world_size; ++px) {
++    if (world_size % px != 0) {
++      continue;
++    }
++    if (mode != DecompositionMode::Brick && px != 1) {
++      continue;
++    }
++    const int32_t remaining = world_size / px;
++    for (int32_t py = 1; py <= remaining; ++py) {
++      if (remaining % py != 0) {
++        continue;
++      }
++      const int32_t pz = remaining / py;
++      if (mode == DecompositionMode::Slab && py != 1) {
++        continue;
++      }
++
++      const int64_t lx = ceil_div(global_extent.x, px);
++      const int64_t ly = ceil_div(global_extent.y, py);
++      const int64_t lz = ceil_div(global_extent.z, pz);
++      if (lx <= 0 || ly <= 0 || lz <= 0) {
++        continue;
++      }
++
++      long double surface = 0.0L;
++      if (px > 1) {
++        surface += 2.0L * static_cast<long double>(ly) * static_cast<long double>(lz);
++      }
++      if (py > 1) {
++        surface += 2.0L * static_cast<long double>(lx) * static_cast<long double>(lz);
++      }
++      if (pz > 1) {
++        surface += 2.0L * static_cast<long double>(lx) * static_cast<long double>(ly);
++      }
++
++      const int split_axes = (px > 1 ? 1 : 0) + (py > 1 ? 1 : 0) + (pz > 1 ? 1 : 0);
++      // Prefer pencil-like two-axis splits on ties: they avoid the uncoalesced X faces
++      // without adding a third exchange axis.
++      const int split_penalty = (split_axes == 2) ? 0 : (split_axes == 1 ? 1 : 2);
++
++      if (!found || surface < best_surface ||
++          (surface == best_surface &&
++           (split_penalty < best_split_penalty ||
++            (split_penalty == best_split_penalty &&
++             (pz > best_pz || (pz == best_pz && py > best_py)))))) {
++        found = true;
++        best = {px, py, pz};
++        best_surface = surface;
++        best_split_penalty = split_penalty;
++        best_py = py;
++        best_pz = pz;
++      }
++    }
++  }
++
++  return found ? best : factorized_dims(world_size, mode);
++}
++
+ }  // namespace
+ 
+ auto
+@@ -98,6 +176,23 @@
+ }
+ 
+ auto
++ProcessGrid::make(int32_t world_size,
++                  DecompositionMode mode,
++                  int64_3d global_extent) -> ProcessGrid {
++  if (world_size <= 0) {
++    log::throw_with_log<std::invalid_argument>(
++        "carbon::ProcessGrid::make: world_size must be > 0 (got {})", world_size);
++    return ProcessGrid{};
++  }
++  if (mode == DecompositionMode::Custom) {
++    log::throw_with_log<std::invalid_argument>(
++        "carbon::ProcessGrid::make: Custom mode requires ProcessGrid::custom()");
++    return ProcessGrid{};
++  }
++  return ProcessGrid{extent_aware_dims(world_size, mode, global_extent), mode};
++}
++
++auto
+ ProcessGrid::custom(int32_t world_size,
+                     int32_t px,
+                     int32_t py,
+diff --git a/src/dense_distributed.cpp b/src/dense_distributed.cpp
+--- a/src/dense_distributed.cpp
++++ b/src/dense_distributed.cpp
+@@ -243,7 +243,19 @@
+     : DenseDistributed() {
+   const int world_size = resolve_world_size(system);
+   const ProcessGrid pg =
+-      world_size > 0 ? ProcessGrid::make(world_size, decomposition) : ProcessGrid{};
++      world_size > 0 ? ProcessGrid::make(world_size, decomposition, global_extent)
++                     : ProcessGrid{};
++  if (world_size > 0) {
++    const carbon::Distributed* distributed = system.distributed();
++    if (distributed == nullptr || distributed->world_rank() == 0) {
++      const int32_3d dims = pg.dims();
++      CARBON_LOG_INFO(
++          "DenseDistributed: process_grid={}x{}x{} (mode={}, world_size={}, "
++          "global_extent={}x{}x{})",
++          dims.x, dims.y, dims.z, static_cast<int>(decomposition), world_size, global_extent.x,
++          global_extent.y, global_extent.z);
++    }
++  }
+   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
+                pg, block_override);
+ }
+diff --git a/include/carbon/detail/dense_distributed/layout.h b/include/carbon/detail/dense_distributed/layout.h
+--- a/include/carbon/detail/dense_distributed/layout.h
++++ b/include/carbon/detail/dense_distributed/layout.h
+@@ -81,7 +81,7 @@
+   return int64_3d{
+       axis_halo(radius3.x, dims.x, Axis::X),
+       axis_halo(radius3.y, dims.y, Axis::Y),
+-      pg.is_slab() ? static_cast<int64_t>(stencil.radius()) : axis_halo(radius3.z, dims.z, Axis::Z),
++      axis_halo(radius3.z, dims.z, Axis::Z),
+   };
+ }
+ 
+diff --git a/tests/test_process_grid.cpp b/tests/test_process_grid.cpp
+--- a/tests/test_process_grid.cpp
++++ b/tests/test_process_grid.cpp
+@@ -102,6 +102,33 @@
+ }
+ 
+ void
++test_extent_aware() {
++  const int32_3d cube{256, 256, 256};
++
++  const ProcessGrid eight = ProcessGrid::make(8, DecompositionMode::Brick, cube);
++  assert(eight.dims() == (int32_3d{1, 2, 4}));
++  assert(eight.mode() == DecompositionMode::Brick);
++  expect_round_trip(eight);
++
++  const ProcessGrid four = ProcessGrid::make(4, DecompositionMode::Brick, cube);
++  assert(four.dims() == (int32_3d{1, 2, 2}));
++  expect_round_trip(four);
++
++  const ProcessGrid twelve = ProcessGrid::make(12, DecompositionMode::Brick, cube);
++  assert(twelve.dims() == (int32_3d{1, 3, 4}));
++  expect_round_trip(twelve);
++
++  const ProcessGrid pencil = ProcessGrid::make(8, DecompositionMode::Pencil, cube);
++  assert(pencil.dims() == (int32_3d{1, 2, 4}));
++  expect_round_trip(pencil);
++
++  const ProcessGrid fallback =
++      ProcessGrid::make(8, DecompositionMode::Brick, int32_3d{0, 0, 0});
++  assert(fallback.dims() == (int32_3d{2, 2, 2}));
++  expect_round_trip(fallback);
++}
++
++void
+ test_custom() {
+   const ProcessGrid grid = ProcessGrid::custom(24, 2, 3, 4);
+   const int32_3d expected_dims{2, 3, 4};
+@@ -128,6 +155,9 @@
+       [] { static_cast<void>(ProcessGrid::make(-4, DecompositionMode::Brick)); });
+   expect_invalid_argument(
+       [] { static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom)); });
++  expect_invalid_argument([] {
++    static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom, int32_3d{8, 8, 8}));
++  });
+ 
+   expect_invalid_argument([] { static_cast<void>(ProcessGrid::custom(0, 1, 1, 1)); });
+   expect_invalid_argument([] { static_cast<void>(ProcessGrid::custom(8, 0, 2, 4)); });
+@@ -158,6 +188,7 @@
+   test_slab();
+   test_pencil();
+   test_brick();
++  test_extent_aware();
+   test_custom();
+   test_invalid();
+ }
+\ No newline at end of file
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -6238,3 +6238,10 @@
+   `System::stream()` per call (the old reference raced the inline D-to-H copy on SYCL OpenMP).
+   Verified with `test_skeleton_reduce_split`, `test_reduce_sum`, and `test_reduce_ops` on SYCL
+   OpenMP, and with `test_skeleton_reduce_split` on CUDA.
++- **2026-11 — §3.5/§3.8 host and process-grid overhead reduced.** `DistTransfer` now
++  precomputes byte offsets/counts at construction instead of allocating two vectors per
++  exchange, and `HaloDistributed` only allocates/records cross-GPU fence events when more than
++  one local GPU is present. `ProcessGrid::make(world, mode, global_extent)` chooses the
++  factorisation that minimises the per-rank halo surface for the requested mode, preferring
++  pencil-like two-axis splits on ties; `DenseDistributed` uses it for `Pencil`/`Brick` and logs
++  the chosen dims on rank 0. Non-legacy slabs now use `stencil.radius3().z` for the z halo.

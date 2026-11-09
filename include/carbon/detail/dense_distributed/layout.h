@@ -81,7 +81,7 @@ halo_extent(const ProcessGrid& pg,
   return int64_3d{
       axis_halo(radius3.x, dims.x, Axis::X),
       axis_halo(radius3.y, dims.y, Axis::Y),
-      pg.is_slab() ? static_cast<int64_t>(stencil.radius()) : axis_halo(radius3.z, dims.z, Axis::Z),
+      axis_halo(radius3.z, dims.z, Axis::Z),
   };
 }
 

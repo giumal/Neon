@@ -102,6 +102,33 @@ test_brick() {
 }
 
 void
+test_extent_aware() {
+  const int32_3d cube{256, 256, 256};
+
+  const ProcessGrid eight = ProcessGrid::make(8, DecompositionMode::Brick, cube);
+  assert(eight.dims() == (int32_3d{1, 2, 4}));
+  assert(eight.mode() == DecompositionMode::Brick);
+  expect_round_trip(eight);
+
+  const ProcessGrid four = ProcessGrid::make(4, DecompositionMode::Brick, cube);
+  assert(four.dims() == (int32_3d{1, 2, 2}));
+  expect_round_trip(four);
+
+  const ProcessGrid twelve = ProcessGrid::make(12, DecompositionMode::Brick, cube);
+  assert(twelve.dims() == (int32_3d{1, 3, 4}));
+  expect_round_trip(twelve);
+
+  const ProcessGrid pencil = ProcessGrid::make(8, DecompositionMode::Pencil, cube);
+  assert(pencil.dims() == (int32_3d{1, 2, 4}));
+  expect_round_trip(pencil);
+
+  const ProcessGrid fallback =
+      ProcessGrid::make(8, DecompositionMode::Brick, int32_3d{0, 0, 0});
+  assert(fallback.dims() == (int32_3d{2, 2, 2}));
+  expect_round_trip(fallback);
+}
+
+void
 test_custom() {
   const ProcessGrid grid = ProcessGrid::custom(24, 2, 3, 4);
   const int32_3d expected_dims{2, 3, 4};
@@ -128,6 +155,9 @@ test_invalid() {
       [] { static_cast<void>(ProcessGrid::make(-4, DecompositionMode::Brick)); });
   expect_invalid_argument(
       [] { static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom)); });
+  expect_invalid_argument([] {
+    static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom, int32_3d{8, 8, 8}));
+  });
 
   expect_invalid_argument([] { static_cast<void>(ProcessGrid::custom(0, 1, 1, 1)); });
   expect_invalid_argument([] { static_cast<void>(ProcessGrid::custom(8, 0, 2, 4)); });
@@ -158,6 +188,7 @@ int main() {
   test_slab();
   test_pencil();
   test_brick();
+  test_extent_aware();
   test_custom();
   test_invalid();
 }

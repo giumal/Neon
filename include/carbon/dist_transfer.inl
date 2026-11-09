@@ -58,14 +58,8 @@ DistTransfer<T>::operator()(const Stream& stream) const -> void {
   if (counts_.empty()) {
     return;
   }
-  std::vector<size_t> first_bytes(counts_.size());
-  std::vector<size_t> byte_counts(counts_.size());
-  for (size_t i = 0; i < counts_.size(); ++i) {
-    first_bytes[i] = first_elements_[i] * sizeof(T);
-    byte_counts[i] = counts_[i] * sizeof(T);
-  }
   dist_transfer_detail::run(system_, static_cast<void*>(buffer_[0].data()), peer_ranks_, ops_,
-                            first_bytes, byte_counts, stream);
+                            first_bytes_, byte_counts_, stream);
 }
 
 }  // namespace carbon

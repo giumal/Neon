@@ -1,0 +1,1044 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -6245,3 +6245,13 @@
+   factorisation that minimises the per-rank halo surface for the requested mode, preferring
+   pencil-like two-axis splits on ties; `DenseDistributed` uses it for `Pencil`/`Brick` and logs
+   the chosen dims on rank 0. Non-legacy slabs now use `stencil.radius3().z` for the z halo.
++- **2026-11 — Opt-in padded `DenseDistributed` storage layout (§3.1a).** `LayoutOptions`
++  (`pad_rows`, `row_alignment`, `component_alignment`) is threaded through the
++  `DenseDistributed` constructors into `rank_chunk`/`Span`. With `pad_rows` enabled, rows are
++  rounded up to 32 elements (128 B for fp32), each component plane gets a lead pad so buffer
++  `x == halo.x` is row-aligned, and the component stride is rounded up to 64 elements (256 B for
++  fp32). The default remains the exact historical compact layout. `Span` now exposes
++  `y_stride()` / `lead_pad()` and uses them in `linear_offset`; `Partition::cursor`, the host
++  fill helpers, the multi-axis run-based halo geometry, the packed pack/unpack plan, and the VTK
++  shard writer all follow the padded strides. The host test adds a padded-layout case plus
++  padded X/Y/Z packed and run-based exchange scenarios.
+diff --git a/include/carbon/dense_distributed.h b/include/carbon/dense_distributed.h
+--- a/include/carbon/dense_distributed.h
++++ b/include/carbon/dense_distributed.h
+@@ -3,6 +3,7 @@
+ #include <carbon/boundary_mode_distributed.h>
+ #include <carbon/data_view.h>
+ #include <carbon/detail/dense_distributed/kernel.h>
++#include <carbon/detail/dense_distributed/layout.h>
+ #include <carbon/detail/dense_distributed/partition.h>
+ #include <carbon/detail/dense_distributed/span.h>
+ #include <carbon/export.h>
+@@ -81,6 +82,8 @@
+ public:
+   /** Per-GPU chunk layout (alias of @c detail::dense_distributed::Span). */
+   using Span = detail::dense_distributed::Span;
++  /** Opt-in storage-padding knobs (alias of @c detail::dense_distributed::LayoutOptions). */
++  using LayoutOptions = detail::dense_distributed::LayoutOptions;
+   /** Cell index for dense kernels (alias of @c detail::dense_distributed::Idx). */
+   using Idx = detail::dense_distributed::Idx;
+ 
+@@ -122,6 +125,9 @@
+    * @param block_override When set, used as the CUDA/SYCL launch block for every local GPU
+    *                      instead of @c dense_make_kernel_block(). The matching launch grid
+    *                      is derived via @c compute_dense_grid for each @ref DataView.
++   * @param layout        Opt-in storage padding. The default keeps the historical compact
++   *                      layout; @c LayoutOptions{.pad_rows=true} rounds row and component
++   *                      pitches for better coalescing on the device.
+    */
+   DenseDistributed(System system,
+                    int64_3d global_extent,
+@@ -129,7 +135,8 @@
+                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
+                    float32_3d origin = {},
+                    float spacing = 1.0F,
+-                   std::optional<LaunchShape> block_override = std::nullopt);
++                   std::optional<LaunchShape> block_override = std::nullopt,
++                   LayoutOptions layout = {});
+ 
+   /**
+    * @brief Build a layout by auto-factorizing the world size for @p decomposition.
+@@ -144,7 +151,8 @@
+                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
+                    float32_3d origin = {},
+                    float spacing = 1.0F,
+-                   std::optional<LaunchShape> block_override = std::nullopt);
++                   std::optional<LaunchShape> block_override = std::nullopt,
++                   LayoutOptions layout = {});
+ 
+   /**
+    * @brief Build a layout from an explicit @p process_grid.
+@@ -159,7 +167,8 @@
+                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
+                    float32_3d origin = {},
+                    float spacing = 1.0F,
+-                   std::optional<LaunchShape> block_override = std::nullopt);
++                   std::optional<LaunchShape> block_override = std::nullopt,
++                   LayoutOptions layout = {});
+ 
+   /**
+    * @brief Default-construct an empty grid: zero global extent, default
+@@ -590,7 +599,8 @@
+                float32_3d origin,
+                float spacing,
+                ProcessGrid process_grid,
+-               std::optional<LaunchShape> block_override);
++               std::optional<LaunchShape> block_override,
++               LayoutOptions layout);
+ 
+   ProcessGrid process_grid_{};
+ };
+diff --git a/include/carbon/detail/dense_distributed/field.h b/include/carbon/detail/dense_distributed/field.h
+--- a/include/carbon/detail/dense_distributed/field.h
++++ b/include/carbon/detail/dense_distributed/field.h
+@@ -288,6 +288,8 @@
+       const auto owned = span.logic_extent();
+       const auto halo = span.halo();
+       const int64_t pitch = span.xy_slab_elements();
++      const int64_t y_stride = span.y_stride();
++      const int64_t lead_pad = span.lead_pad();
+       const int64_t x_origin = span.x_offset();
+       const int64_t y_origin = span.y_offset();
+       const int64_t z_origin = span.z_offset();
+@@ -302,7 +304,7 @@
+           for (int64_t y = halo.y; y < halo.y + owned.y; ++y) {
+             const int64_t global_y = y_origin + y;
+             for (int64_t x = halo.x; x < halo.x + owned.x; ++x) {
+-              const int64_t off = plane + z * pitch + y * haloed.x + x;
++              const int64_t off = plane + lead_pad + z * pitch + y * y_stride + x;
+               h[off] = static_cast<T>(fn(::carbon::int64_3d(x_origin + x, global_y, global_z), c));
+             }
+           }
+@@ -356,6 +358,8 @@
+       const auto& span = spans[g];
+       const auto haloed = span.haloed_extent();
+       const int64_t pitch = span.xy_slab_elements();
++      const int64_t y_stride = span.y_stride();
++      const int64_t lead_pad = span.lead_pad();
+       const int64_t x_origin = span.x_offset();
+       const int64_t y_origin = span.y_offset();
+       const int64_t z_origin = span.z_offset();
+@@ -370,7 +374,7 @@
+           for (int64_t y = 0; y < haloed.y; ++y) {
+             const int64_t global_y = y_origin + y;
+             for (int64_t x = 0; x < haloed.x; ++x) {
+-              const int64_t off = plane + z * pitch + y * haloed.x + x;
++              const int64_t off = plane + lead_pad + z * pitch + y * y_stride + x;
+               h[off] = static_cast<T>(fn(::carbon::int64_3d(x_origin + x, global_y, global_z), c));
+             }
+           }
+diff --git a/include/carbon/detail/dense_distributed/layout.h b/include/carbon/detail/dense_distributed/layout.h
+--- a/include/carbon/detail/dense_distributed/layout.h
++++ b/include/carbon/detail/dense_distributed/layout.h
+@@ -33,6 +33,89 @@
+ 
+ namespace carbon::detail::dense_distributed {
+ 
++/**
++ * Opt-in storage padding for @ref DenseDistributed spans.
++ *
++ * With @c pad_rows disabled (the default) the layout is exactly the historical one:
++ * @c y_stride == haloed.x, no lead pad, and @c component_stride == haloed.z * xy_pitch.
++ *
++ * With @c pad_rows enabled, each y row is rounded up to @p row_alignment elements, each component
++ * plane starts with a lead pad so buffer @c x == halo.x is @p row_alignment aligned, and the
++ * component stride is rounded up to @p component_alignment elements. Both alignments are in
++ * elements, not bytes; the defaults (32 and 64) are 128 B and 256 B for a 4-byte element such as
++ * the fp32 LBM populations. @p component_alignment must be a multiple of @p row_alignment.
++ */
++struct LayoutOptions {
++  bool pad_rows{false};
++  int64_t row_alignment{32};
++  int64_t component_alignment{64};
++};
++
++/** Round @p value up to the next multiple of @p alignment (which must be positive). */
++[[nodiscard]] inline auto
++round_up(int64_t value, int64_t alignment) -> int64_t {
++  if (alignment <= 0) {
++    carbon::log::throw_with_log<std::invalid_argument>(
++        "DenseDistributed: storage alignment must be positive (alignment={})", alignment);
++  }
++  if (value < 0) {
++    carbon::log::throw_with_log<std::invalid_argument>(
++        "DenseDistributed: cannot round a negative extent (value={})", value);
++  }
++  const int64_t remainder = value % alignment;
++  if (remainder == 0) {
++    return value;
++  }
++  const int64_t delta = alignment - remainder;
++  if (value > std::numeric_limits<int64_t>::max() - delta) {
++    carbon::log::throw_with_log<std::overflow_error>(
++        "DenseDistributed: padded storage extent overflows int64 (value={}, alignment={})", value,
++        alignment);
++  }
++  return value + delta;
++}
++
++/** Per-component storage strides derived from an extent and @ref LayoutOptions. */
++struct StoragePadding {
++  int64_t y_stride{};
++  int64_t lead_pad{};
++  int64_t xy_pitch{};
++  int64_t component_stride{};
++};
++
++/**
++ * Compute the padded storage layout for @p haloed / @p halo. The returned offsets are all in
++ * elements. The default @ref LayoutOptions reproduces the historical unpadded layout exactly.
++ */
++[[nodiscard]] inline auto
++storage_padding(const int64_3d& haloed,
++                const int64_3d& halo,
++                const LayoutOptions& layout = {}) -> StoragePadding {
++  StoragePadding p;
++  p.y_stride = haloed.x;
++  p.lead_pad = 0;
++  p.xy_pitch = haloed.x * haloed.y;
++  p.component_stride = haloed.z * p.xy_pitch;
++  if (!layout.pad_rows) {
++    return p;
++  }
++  if (layout.row_alignment <= 0 || layout.component_alignment <= 0) {
++    carbon::log::throw_with_log<std::invalid_argument>(
++        "DenseDistributed: storage alignments must be positive (row={}, component={})",
++        layout.row_alignment, layout.component_alignment);
++  }
++  if (layout.component_alignment % layout.row_alignment != 0) {
++    carbon::log::throw_with_log<std::invalid_argument>(
++        "DenseDistributed: component_alignment ({}) must be a multiple of row_alignment ({})",
++        layout.component_alignment, layout.row_alignment);
++  }
++  p.y_stride = round_up(haloed.x, layout.row_alignment);
++  p.lead_pad = (layout.row_alignment - (halo.x % layout.row_alignment)) % layout.row_alignment;
++  p.xy_pitch = p.y_stride * haloed.y;
++  p.component_stride = round_up(p.lead_pad + haloed.z * p.xy_pitch, layout.component_alignment);
++  return p;
++}
++
+ /** Split @p n layers over @p num_parts coordinates as evenly as possible (earlier ones get +1). */
+ [[nodiscard]] inline auto
+ split_extent(int64_t n,
+@@ -131,8 +214,14 @@
+   int64_3d halo{};
+   /** Storage extent: owned + 2 * halo on each axis. */
+   int64_3d haloed{};
+-  /** Elements per XY plane (@c haloed.x * haloed.y). */
++  /** Elements between adjacent y rows; @c haloed.x when row padding is disabled. */
++  int64_t y_stride{};
++  /** Elements per XY plane, including row padding when enabled. */
+   int64_t xy_pitch{};
++  /** Elements per component plane, including lead pad and tail padding. */
++  int64_t component_stride{};
++  /** Elements before buffer @c x == 0 in each component plane. */
++  int64_t lead_pad{};
+ };
+ 
+ /** Chunk owned by process coordinate @p coords of @p pg over @p global, with halo @p halo. */
+@@ -140,7 +229,8 @@
+ rank_chunk(const int64_3d& global,
+            const ProcessGrid& pg,
+            int32_3d coords,
+-           const int64_3d& halo) -> RankChunk {
++           const int64_3d& halo,
++           const LayoutOptions& layout = {}) -> RankChunk {
+   const int32_3d dims = pg.dims();
+   const auto locate = [](int64_t n, int32_t parts, int32_t coord) -> std::pair<int64_t, int64_t> {
+     const std::vector<size_t> counts = split_extent(n, static_cast<size_t>(parts));
+@@ -159,7 +249,11 @@
+   c.halo = halo;
+   c.offset = {ox - halo.x, oy - halo.y, oz - halo.z};
+   c.haloed = {nx + 2 * halo.x, ny + 2 * halo.y, nz + 2 * halo.z};
+-  c.xy_pitch = c.haloed.x * c.haloed.y;
++  const StoragePadding padding = storage_padding(c.haloed, c.halo, layout);
++  c.y_stride = padding.y_stride;
++  c.xy_pitch = padding.xy_pitch;
++  c.component_stride = padding.component_stride;
++  c.lead_pad = padding.lead_pad;
+   return c;
+ }
+ 
+diff --git a/include/carbon/detail/dense_distributed/partition.h b/include/carbon/detail/dense_distributed/partition.h
+--- a/include/carbon/detail/dense_distributed/partition.h
++++ b/include/carbon/detail/dense_distributed/partition.h
+@@ -269,14 +269,14 @@
+                                                   Components> {
+ #ifndef NDEBUG
+     return Cursor<T, Components>{ptr_ + span.linear_offset(idx, 0),
+-                                 static_cast<int32_t>(span.haloed_extent().x),
++                                 static_cast<int32_t>(span.y_stride()),
+                                  static_cast<int32_t>(span.xy_slab_elements()),
+                                  span.linear_storage_elements(),
+                                  idx.cell(),
+                                  span.haloed_extent()};
+ #else
+     return Cursor<T, Components>{
+-        ptr_ + span.linear_offset(idx, 0), static_cast<int32_t>(span.haloed_extent().x),
++        ptr_ + span.linear_offset(idx, 0), static_cast<int32_t>(span.y_stride()),
+         static_cast<int32_t>(span.xy_slab_elements()), span.linear_storage_elements()};
+ #endif
+   }
+diff --git a/include/carbon/detail/dense_distributed/span.h b/include/carbon/detail/dense_distributed/span.h
+--- a/include/carbon/detail/dense_distributed/span.h
++++ b/include/carbon/detail/dense_distributed/span.h
+@@ -40,7 +40,8 @@
+  *   cells follow, and the upper halo the remaining @c halo() layers.
+  * - @c xy_slab_elements() is the number of T-sized elements between two adjacent z planes in
+  *   the haloed buffer. It is at least @c haloed_extent().x * haloed_extent().y ; halos are
+- *   included in the extent rather than encoded as pitch padding.
++ *   included in the extent. When @ref LayoutOptions::pad_rows is enabled it is
++ *   @c y_stride() * haloed_extent().y , with each row rounded up to the requested alignment.
+  * - @c global_extent() is the full Cartesian grid extent shared by every chunk. It is needed to
+  *   distinguish, in @c Partition::neighbour, an in-buffer halo cell that maps to a real global
+  *   cell (interior chunk boundary) from one that lies outside the global domain (an open face).
+@@ -52,6 +53,9 @@
+   int64_3d haloed_extent_{};
+   int64_3d global_extent_{};
+   int64_t xy_slab_elements_{};
++  int64_t y_stride_{};
++  int64_t component_stride_{};
++  int64_t lead_pad_{};
+   int64_3d offset_{};
+   int64_3d halo_{};
+   BoundaryModeDistributed boundary_mode_{BoundaryModeDistributed::Open};
+@@ -70,10 +74,18 @@
+                            BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
+                            bool legacy_slab = false,
+                            float32_3d origin = {},
+-                           float spacing = 1.0F) noexcept
++                           float spacing = 1.0F,
++                           int64_t y_stride = 0,
++                           int64_t component_stride = 0,
++                           int64_t lead_pad = 0) noexcept
+       : haloed_extent_(haloed_extent),
+         global_extent_(global_extent),
+         xy_slab_elements_(xy_slab_elements),
++        y_stride_(y_stride > 0 ? y_stride : haloed_extent.x),
++        component_stride_(component_stride > 0
++                              ? component_stride
++                              : lead_pad + haloed_extent.z * xy_slab_elements),
++        lead_pad_(lead_pad),
+         offset_(offset),
+         halo_(halo),
+         boundary_mode_(boundary_mode),
+@@ -103,6 +115,13 @@
+    * @param origin            Physical-space origin of global cell @c (0,0,0)'s corner (same
+    *                          convention as @c global_location on integer indices).
+    * @param spacing           Isotropic cell spacing along every axis (must be finite and > 0).
++   * @param y_stride          Elements between adjacent y rows. Default 0 keeps the historical
++   *                          @c haloed_extent.x stride. DenseDistributed passes the padded value
++   *                          when @ref LayoutOptions::pad_rows is enabled.
++   * @param component_stride  Elements per component plane, including any lead pad and tail
++   *                          padding. Default 0 derives the historical
++   *                          @c haloed_extent.z * xy_slab_elements pitch.
++   * @param lead_pad          Elements before buffer @c x == 0 in each component plane. Default 0.
+    */
+   /** Z-only convenience overload: equivalent to full @c offset={0,0,z_offset} and
+    *  @c halo={0,0,halo_z}. @p legacy_slab defaults to false; pass true for a legacy z-slab. */
+@@ -114,7 +133,10 @@
+                            BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
+                            bool legacy_slab = false,
+                            float32_3d origin = {},
+-                           float spacing = 1.0F) noexcept
++                           float spacing = 1.0F,
++                           int64_t y_stride = 0,
++                           int64_t component_stride = 0,
++                           int64_t lead_pad = 0) noexcept
+       : Span(haloed_extent,
+              global_extent,
+              xy_slab_elements,
+@@ -127,7 +149,10 @@
+              boundary_mode,
+              legacy_slab,
+              origin,
+-             spacing) {}
++             spacing,
++             y_stride,
++             component_stride,
++             lead_pad) {}
+ 
+   /** Storage extent (includes halo layers on every axis where @ref halo() is non-zero). */
+   [[nodiscard]] CARBON_HD constexpr auto
+@@ -209,12 +234,27 @@
+     return owned;
+   }
+ 
+-  /** Elements per XY plane (pitch in elements), same for halo and owned layers. */
++  /**
++   * Elements per XY plane (pitch in elements), same for halo and owned layers. With row padding
++   * enabled this is @c y_stride * haloed_extent().y rather than the minimum @c x * y.
++   */
+   [[nodiscard]] CARBON_HD constexpr auto
+   xy_slab_elements() const noexcept -> int64_t {
+     return xy_slab_elements_;
+   }
+ 
++  /** Elements between adjacent y rows (at least @c haloed_extent().x). */
++  [[nodiscard]] CARBON_HD constexpr auto
++  y_stride() const noexcept -> int64_t {
++    return y_stride_;
++  }
++
++  /** Elements before buffer @c x == 0 in each component plane (zero when unpadded). */
++  [[nodiscard]] CARBON_HD constexpr auto
++  lead_pad() const noexcept -> int64_t {
++    return lead_pad_;
++  }
++
+   [[nodiscard]] CARBON_HD constexpr auto
+   offset() const noexcept -> int64_3d {
+     return offset_;
+@@ -274,13 +314,13 @@
+   }
+ 
+   /**
+-   * Contiguous element count for this slab's storage: @c haloed_extent().z layers times
+-   * @c xy_slab_elements() per layer. Matches the buffer sizing used by
+-   * @c DenseDistributed::newField (lower halo + owned + upper halo).
++   * Contiguous element count for one component plane: the component stride, including any lead
++   * pad and tail padding. Matches the buffer sizing used by @c DenseDistributed::newField
++   * (lower halo + owned + upper halo, plus optional storage padding).
+    */
+   [[nodiscard]] CARBON_HD constexpr auto
+   linear_storage_elements() const noexcept -> int64_t {
+-    return haloed_extent_.z * xy_slab_elements_;
++    return component_stride_;
+   }
+ 
+   /**
+@@ -331,7 +371,8 @@
+   /**
+    * Element offset (in units of @c T) from the start of a partition buffer to the cell at @p idx
+    * for component @p component_id, using this span's SoA dense layout:
+-   * @c component_id * linear_storage_elements() + iz * xy_slab_elements() + iy * haloed_extent().x + ix.
++   * @c component_id * linear_storage_elements() + lead_pad() + iz * xy_slab_elements() +
++   * iy * y_stride() + ix.
+    *
+    * Matches Neon's @c dPartition::getPitch with its default pitch. No bounds checking.
+    */
+@@ -476,8 +517,8 @@
+ Span::linear_offset(const Idx& idx,
+                     int component_id) const noexcept -> int64_t {
+   const int64_3d cell = idx.cell();
+-  return static_cast<int64_t>(component_id) * linear_storage_elements() +
+-         cell.z * xy_slab_elements_ + cell.y * haloed_extent_.x + cell.x;
++  return static_cast<int64_t>(component_id) * component_stride_ + lead_pad_ +
++         cell.z * xy_slab_elements_ + cell.y * y_stride_ + cell.x;
+ }
+ 
+ [[nodiscard]] CARBON_HD constexpr auto
+diff --git a/include/carbon/detail/halo_distributed_build.h b/include/carbon/detail/halo_distributed_build.h
+--- a/include/carbon/detail/halo_distributed_build.h
++++ b/include/carbon/detail/halo_distributed_build.h
+@@ -10,7 +10,9 @@
+  * (with periodic wrap). They are pure host-side index arithmetic: no device state, no MPI.
+  *
+  * Storage addressing (matches @c DenseDistributed::Span): element @c (x, y, z) of one component
+- * lives at @c z * pitch + y * haloed.x + x, where @c pitch is the number of elements per XY plane.
++ * lives at @c lead_pad + z * pitch + y * y_stride + x, where @c pitch is the number of elements per
++ * XY plane. @c y_stride is @c haloed.x for the historical unpadded layout and larger when row
++ * padding is enabled.
+  *
+  * Kept apart from @c halo_build.h so the Z-slab @ref Halo keeps its original helper set untouched.
+  */
+@@ -44,6 +46,10 @@
+   int64_3d halo{};
+   int64_3d haloed{};
+   int64_t pitch{};
++  /** Elements between adjacent y rows; 0 means "use haloed.x" (unpadded compatibility). */
++  int64_t y_stride{};
++  /** Elements before buffer x == 0 in each component plane. */
++  int64_t lead_pad{};
+ };
+ 
+ struct AxisRun {
+@@ -114,6 +120,7 @@
+                AxisSide side) -> std::vector<AxisRun> {
+   std::vector<AxisRun> runs;
+ 
++  const int64_t y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
+   const int64_t owned = axis_value(g.owned, axis);
+   const int64_t halo = axis_value(g.halo, axis);
+   if (halo <= 0) {
+@@ -133,7 +140,8 @@
+       for (int64_t z = 0; z < g.haloed.z; ++z) {
+         for (int64_t y = 0; y < g.haloed.y; ++y) {
+           runs.push_back({
+-              static_cast<size_t>(z * g.pitch + y * g.haloed.x) + static_cast<size_t>(start),
++              static_cast<size_t>(g.lead_pad + z * g.pitch + y * y_stride) +
++                  static_cast<size_t>(start),
+               count,
+           });
+         }
+@@ -142,8 +150,9 @@
+     }
+ 
+     case Axis::Y: {
+-      const int64_t start = (side == AxisSide::Lower ? 0 : g.halo.y + g.owned.y) * g.haloed.x;
+-      const size_t count = static_cast<size_t>(g.halo.y * g.haloed.x);
++      const int64_t start =
++          g.lead_pad + (side == AxisSide::Lower ? 0 : g.halo.y + g.owned.y) * y_stride;
++      const size_t count = static_cast<size_t>(g.halo.y * y_stride);
+       runs.reserve(static_cast<size_t>(g.haloed.z));
+       for (int64_t z = 0; z < g.haloed.z; ++z) {
+         runs.push_back({
+@@ -155,7 +164,8 @@
+     }
+ 
+     case Axis::Z: {
+-      const int64_t start = (side == AxisSide::Lower ? 0 : g.halo.z + g.owned.z) * g.pitch;
++      const int64_t start =
++          g.lead_pad + (side == AxisSide::Lower ? 0 : g.halo.z + g.owned.z) * g.pitch;
+       const size_t count = static_cast<size_t>(g.halo.z * g.pitch);
+       runs.push_back({
+           static_cast<size_t>(start),
+@@ -174,6 +184,7 @@
+                      AxisSide side) -> std::vector<AxisRun> {
+   std::vector<AxisRun> runs;
+ 
++  const int64_t y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
+   const int64_t owned = axis_value(g.owned, axis);
+   const int64_t halo = axis_value(g.halo, axis);
+   if (halo <= 0) {
+@@ -193,7 +204,8 @@
+       for (int64_t z = 0; z < g.haloed.z; ++z) {
+         for (int64_t y = 0; y < g.haloed.y; ++y) {
+           runs.push_back({
+-              static_cast<size_t>(z * g.pitch + y * g.haloed.x) + static_cast<size_t>(start),
++              static_cast<size_t>(g.lead_pad + z * g.pitch + y * y_stride) +
++                  static_cast<size_t>(start),
+               count,
+           });
+         }
+@@ -202,8 +214,9 @@
+     }
+ 
+     case Axis::Y: {
+-      const int64_t start = (side == AxisSide::Lower ? g.halo.y : g.owned.y) * g.haloed.x;
+-      const size_t count = static_cast<size_t>(g.halo.y * g.haloed.x);
++      const int64_t start =
++          g.lead_pad + (side == AxisSide::Lower ? g.halo.y : g.owned.y) * y_stride;
++      const size_t count = static_cast<size_t>(g.halo.y * y_stride);
+       runs.reserve(static_cast<size_t>(g.haloed.z));
+       for (int64_t z = 0; z < g.haloed.z; ++z) {
+         runs.push_back({
+@@ -215,7 +228,7 @@
+     }
+ 
+     case Axis::Z: {
+-      const int64_t start = (side == AxisSide::Lower ? g.halo.z : g.owned.z) * g.pitch;
++      const int64_t start = g.lead_pad + (side == AxisSide::Lower ? g.halo.z : g.owned.z) * g.pitch;
+       const size_t count = static_cast<size_t>(g.halo.z * g.pitch);
+       runs.push_back({
+           static_cast<size_t>(start),
+diff --git a/include/carbon/detail/halo_pack_plan.h b/include/carbon/detail/halo_pack_plan.h
+--- a/include/carbon/detail/halo_pack_plan.h
++++ b/include/carbon/detail/halo_pack_plan.h
+@@ -93,7 +93,7 @@
+  * Everything a pack/unpack kernel needs, as a POD passed by value.
+  *
+  * Field addressing (matches DenseDistributed): element (c, x, y, z) lives at
+- *   c * comp_stride + z * pitch + y * haloed_x + x.
++ *   c * comp_stride + lead_pad + z * pitch + y * y_stride + x.
+  * Staging addressing: plane k (= the k-th packed component) is contiguous and x-fastest:
+  *   k * stage_comp_stride + (iz * ext_y + iy) * ext_x + ix,   stage_comp_stride = ext_x*ext_y*ext_z.
+  */
+@@ -101,7 +101,8 @@
+   int64_t lo_x{};
+   int64_t lo_y{};
+   int64_t lo_z{};
+-  int64_t haloed_x{};
++  int64_t y_stride{};
++  int64_t lead_pad{};
+   int64_t pitch{};
+   int64_t comp_stride{};
+   int64_t stage_comp_stride{};
+@@ -152,8 +153,8 @@
+   }
+   const uint32_t iy = j / a.ext_x;
+   const uint32_t ix = j - iy * a.ext_x;
+-  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride +
+-                        (a.lo_y + static_cast<int64_t>(iy)) * a.haloed_x + a.lo_x +
++  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride + a.lead_pad +
++                        (a.lo_y + static_cast<int64_t>(iy)) * a.y_stride + a.lo_x +
+                         static_cast<int64_t>(ix);
+   const int64_t sbase = static_cast<int64_t>(bz) * a.stage_comp_stride + static_cast<int64_t>(j);
+   for (uint32_t iz = by; iz < a.ext_z; iz += gdy) {
+@@ -180,8 +181,8 @@
+   }
+   const uint32_t iy = j / a.ext_x;
+   const uint32_t ix = j - iy * a.ext_x;
+-  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride +
+-                        (a.lo_y + static_cast<int64_t>(iy)) * a.haloed_x + a.lo_x +
++  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride + a.lead_pad +
++                        (a.lo_y + static_cast<int64_t>(iy)) * a.y_stride + a.lo_x +
+                         static_cast<int64_t>(ix);
+   const int64_t sbase = static_cast<int64_t>(bz) * a.stage_comp_stride + static_cast<int64_t>(j);
+   for (uint32_t iz = by; iz < a.ext_z; iz += gdy) {
+@@ -370,7 +371,8 @@
+     a.lo_x = box.lo_x;
+     a.lo_y = box.lo_y;
+     a.lo_z = box.lo_z;
+-    a.haloed_x = g.haloed.x;
++    a.y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
++    a.lead_pad = g.lead_pad;
+     a.pitch = g.pitch;
+     a.comp_stride = comp_stride;
+     a.stage_comp_stride = per_comp;
+diff --git a/include/carbon/detail/io_vtk_distributed.inl b/include/carbon/detail/io_vtk_distributed.inl
+--- a/include/carbon/detail/io_vtk_distributed.inl
++++ b/include/carbon/detail/io_vtk_distributed.inl
+@@ -44,11 +44,11 @@
+   int64_t nx{0};
+   int64_t ny{0};
+   int64_t nz{0};
+-  /** Elements between consecutive rows (the haloed x extent). */
++  /** Elements between consecutive rows (the span's y stride, including row padding). */
+   int64_t row_stride{0};
+-  /** Elements between consecutive z planes. */
++  /** Elements between consecutive z planes (including row padding). */
+   int64_t plane_pitch{0};
+-  /** Elements between consecutive components. */
++  /** Elements between consecutive components (including lead and tail padding). */
+   int64_t comp_stride{0};
+ };
+ using VtkBoxPiece = VtkBoxPieceT<const void*>;
+@@ -202,14 +202,14 @@
+     }
+     const int64_3d halo = span.halo();
+     VtkBoxPiece p;
+-    p.row_stride = span.haloed_extent().x;
++    p.row_stride = span.y_stride();
+     p.plane_pitch = span.xy_slab_elements();
+     p.comp_stride = span.linear_storage_elements();
+     p.nx = owned.x;
+     p.ny = owned.y;
+     p.nz = owned.z;
+-    p.start = static_cast<const void*>(field.cpu_buffers()[g].data() + halo.z * p.plane_pitch +
+-                                       halo.y * p.row_stride + halo.x);
++    p.start = static_cast<const void*>(field.cpu_buffers()[g].data() + span.lead_pad() +
++                                       halo.z * p.plane_pitch + halo.y * p.row_stride + halo.x);
+     pieces.push_back(p);
+   }
+ }
+@@ -238,14 +238,14 @@
+     }
+     const int64_3d halo = span.halo();
+     VtkBoxPieceMut p;
+-    p.row_stride = span.haloed_extent().x;
++    p.row_stride = span.y_stride();
+     p.plane_pitch = span.xy_slab_elements();
+     p.comp_stride = span.linear_storage_elements();
+     p.nx = owned.x;
+     p.ny = owned.y;
+     p.nz = owned.z;
+-    p.start = static_cast<void*>(field.cpu_buffers()[g].data() + halo.z * p.plane_pitch +
+-                                 halo.y * p.row_stride + halo.x);
++    p.start = static_cast<void*>(field.cpu_buffers()[g].data() + span.lead_pad() +
++                                 halo.z * p.plane_pitch + halo.y * p.row_stride + halo.x);
+     pieces.push_back(p);
+   }
+ }
+diff --git a/include/carbon/halo_distributed.h b/include/carbon/halo_distributed.h
+--- a/include/carbon/halo_distributed.h
++++ b/include/carbon/halo_distributed.h
+@@ -690,15 +690,18 @@
+       const int64_t lim_z_lo = span_lo.logic_extent().z;
+       const int64_t per_comp_lo = span_lo.linear_storage_elements();
+       const int64_t per_comp_up = span_up.linear_storage_elements();
++      const int64_t lead_pad_lo = span_lo.lead_pad();
++      const int64_t lead_pad_up = span_up.lead_pad();
+ 
+       for (int c = 0; c < Components; ++c) {
+         const size_t cc = static_cast<size_t>(c);
+         // Upward: slab g_lo's last halo_z owned -> slab g_up's lower halo. Skipped under
+         // lattice semantic when stencil[c].z <= 0.
+         if (active_up(c)) {
+-          const size_t up_src_off =
+-              cc * static_cast<size_t>(per_comp_lo) + static_cast<size_t>(lim_z_lo * pitch);
+-          const size_t up_dst_off = cc * static_cast<size_t>(per_comp_up);
++          const size_t up_src_off = cc * static_cast<size_t>(per_comp_lo) +
++                                    static_cast<size_t>(lead_pad_lo + lim_z_lo * pitch);
++          const size_t up_dst_off =
++              cc * static_cast<size_t>(per_comp_up) + static_cast<size_t>(lead_pad_up);
+           if (has_gpu_buffers) {
+             intra.push(gpu_buffers[i_lo], gpu_buffers[i_up], up_src_off, up_dst_off, halo_count);
+           }
+@@ -708,10 +711,10 @@
+         // Downward: slab g_up's first halo_z owned -> slab g_lo's upper halo. Skipped under
+         // lattice semantic when stencil[c].z >= 0.
+         if (active_down(c)) {
+-          const size_t dn_src_off =
+-              cc * static_cast<size_t>(per_comp_up) + static_cast<size_t>(halo_z * pitch);
++          const size_t dn_src_off = cc * static_cast<size_t>(per_comp_up) +
++                                    static_cast<size_t>(lead_pad_up + halo_z * pitch);
+           const size_t dn_dst_off = cc * static_cast<size_t>(per_comp_lo) +
+-                                    static_cast<size_t>((halo_z + lim_z_lo) * pitch);
++                                    static_cast<size_t>(lead_pad_lo + (halo_z + lim_z_lo) * pitch);
+           if (has_gpu_buffers) {
+             intra.push(gpu_buffers[i_up], gpu_buffers[i_lo], dn_src_off, dn_dst_off, halo_count);
+           }
+@@ -746,15 +749,16 @@
+     const auto& span = spans[i_local];
+     const int64_t lim_z = span.logic_extent().z;
+     const int64_t per_comp = span.linear_storage_elements();
++    const int64_t lead_pad = span.lead_pad();
+ 
+     // lo_local: we are the LOWER of the pair, peer is above us. Send our last halo_z owned,
+     //           Recv into our upper halo.
+     // up_local: we are the UPPER of the pair, peer is below us. Send our first halo_z owned,
+     //           Recv into our lower halo.
+-    const size_t send_offset_base =
+-        lo_local ? static_cast<size_t>(lim_z * pitch) : static_cast<size_t>(halo_z * pitch);
+-    const size_t recv_offset_base =
+-        lo_local ? static_cast<size_t>((halo_z + lim_z) * pitch) : static_cast<size_t>(0);
++    const size_t send_offset_base = static_cast<size_t>(
++        lead_pad + (lo_local ? lim_z * pitch : halo_z * pitch));
++    const size_t recv_offset_base = static_cast<size_t>(
++        lead_pad + (lo_local ? (halo_z + lim_z) * pitch : 0));
+ 
+     // Lattice activity. lo_local sends "upward" populations (c.z > 0) and receives
+     // "downward" populations (c.z < 0); up_local is the mirror.
+@@ -836,6 +840,8 @@
+         s.halo(),
+         s.haloed_extent(),
+         s.xy_slab_elements(),
++        s.y_stride(),
++        s.lead_pad(),
+     };
+   };
+ 
+diff --git a/src/dense_distributed.cpp b/src/dense_distributed.cpp
+--- a/src/dense_distributed.cpp
++++ b/src/dense_distributed.cpp
+@@ -86,7 +86,8 @@
+                                float32_3d origin,
+                                float spacing,
+                                ProcessGrid process_grid,
+-                               std::optional<LaunchShape> block_override) {
++                               std::optional<LaunchShape> block_override,
++                               LayoutOptions layout) {
+   if (!std::isfinite(spacing) || spacing <= 0.0F) {
+     log::throw_with_log<std::invalid_argument>(
+         "DenseDistributed: spacing must be finite and strictly positive (spacing={})", spacing);
+@@ -192,11 +193,12 @@
+     const int32_3d gpu_coords =
+         distributed ? coords : process_grid_.coords_of(static_cast<int32_t>(i));
+     const detail::dense_distributed::RankChunk chunk =
+-        detail::dense_distributed::rank_chunk(global_, process_grid_, gpu_coords, halo);
++        detail::dense_distributed::rank_chunk(global_, process_grid_, gpu_coords, halo, layout);
+ 
+     return detail::dense_distributed::Span(chunk.haloed, global_, chunk.xy_pitch, chunk.offset,
+                                            chunk.halo, boundary_mode_, legacy_slab, origin_,
+-                                           spacing_);
++                                           spacing_, chunk.y_stride, chunk.component_stride,
++                                           chunk.lead_pad);
+   });
+ 
+   for (auto view : data_view_options()) {
+@@ -223,13 +225,14 @@
+                                    BoundaryModeDistributed boundary_mode,
+                                    float32_3d origin,
+                                    float spacing,
+-                                   std::optional<LaunchShape> block_override)
++                                   std::optional<LaunchShape> block_override,
++                                   LayoutOptions layout)
+     : DenseDistributed() {
+   const int world_size = resolve_world_size(system);
+   const ProcessGrid pg =
+       world_size > 0 ? ProcessGrid::make(world_size, DecompositionMode::Slab) : ProcessGrid{};
+   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
+-               pg, block_override);
++               pg, block_override, layout);
+ }
+ 
+ DenseDistributed::DenseDistributed(System system,
+@@ -239,7 +242,8 @@
+                                    BoundaryModeDistributed boundary_mode,
+                                    float32_3d origin,
+                                    float spacing,
+-                                   std::optional<LaunchShape> block_override)
++                                   std::optional<LaunchShape> block_override,
++                                   LayoutOptions layout)
+     : DenseDistributed() {
+   const int world_size = resolve_world_size(system);
+   const ProcessGrid pg =
+@@ -257,7 +261,7 @@
+     }
+   }
+   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
+-               pg, block_override);
++               pg, block_override, layout);
+ }
+ 
+ DenseDistributed::DenseDistributed(System system,
+@@ -267,10 +271,11 @@
+                                    BoundaryModeDistributed boundary_mode,
+                                    float32_3d origin,
+                                    float spacing,
+-                                   std::optional<LaunchShape> block_override)
++                                   std::optional<LaunchShape> block_override,
++                                   LayoutOptions layout)
+     : DenseDistributed() {
+   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
+-               std::move(process_grid), block_override);
++               std::move(process_grid), block_override, layout);
+ }
+ 
+ auto
+diff --git a/tests/test_dense_distributed_host.cpp b/tests/test_dense_distributed_host.cpp
+--- a/tests/test_dense_distributed_host.cpp
++++ b/tests/test_dense_distributed_host.cpp
+@@ -200,7 +200,8 @@
+            int comps,
+            int lattice_q,
+            bool lattice_distributed,
+-           int64_t pitch_pad) -> World {
++           int64_t pitch_pad,
++           const dd::LayoutOptions& layout = {}) -> World {
+   World w;
+   w.pg = pg;
+   w.bm = bm;
+@@ -217,7 +218,7 @@
+     rk.coords = pg.coords_of(r);
+     // Geometry comes from the production layout functions, so Part C exercises the real
+     // decomposition (not a second copy of it).
+-    const dd::RankChunk chunk = dd::rank_chunk(global, pg, rk.coords, hh);
++    const dd::RankChunk chunk = dd::rank_chunk(global, pg, rk.coords, hh, layout);
+     rk.offset = {chunk.offset.x + hh.x, chunk.offset.y + hh.y, chunk.offset.z + hh.z};
+     const auto sx = std::pair<int64_t, int64_t>{chunk.owned.x, rk.offset.x};
+     const auto sy = std::pair<int64_t, int64_t>{chunk.owned.y, rk.offset.y};
+@@ -225,8 +226,10 @@
+     rk.g.owned = chunk.owned;
+     rk.g.halo = hh;
+     rk.g.haloed = chunk.haloed;
+-    rk.g.pitch = rk.g.haloed.x * rk.g.haloed.y + pitch_pad;
+-    rk.comp_stride = rk.g.pitch * rk.g.haloed.z;
++    rk.g.pitch = chunk.xy_pitch + pitch_pad;
++    rk.g.y_stride = chunk.y_stride;
++    rk.g.lead_pad = chunk.lead_pad;
++    rk.comp_stride = chunk.component_stride + pitch_pad * rk.g.haloed.z;
+     rk.buf.assign(static_cast<size_t>(rk.comp_stride) * static_cast<size_t>(w.comps), kSentinel);
+     // Stand-in for user boundary-condition data living in exterior halo cells: a value unique to
+     // (rank, cell) so any stray overwrite is visible. Cells that a correct exchange fills get
+@@ -238,8 +241,9 @@
+       for (int64_t z = 0; z < sz.first; ++z) {
+         for (int64_t y = 0; y < sy.first; ++y) {
+           for (int64_t x = 0; x < sx.first; ++x) {
+-            const size_t idx = static_cast<size_t>(c * rk.comp_stride + (z + hh.z) * rk.g.pitch +
+-                                                   (y + hh.y) * rk.g.haloed.x + (x + hh.x));
++            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
++                                                   (z + hh.z) * rk.g.pitch +
++                                                   (y + hh.y) * rk.g.y_stride + (x + hh.x));
+             rk.buf[idx] = encode(rk.offset.x + x, rk.offset.y + y, rk.offset.z + z, c);
+           }
+         }
+@@ -432,8 +436,8 @@
+       for (int64_t z = 0; z < rk.g.haloed.z; ++z) {
+         for (int64_t y = 0; y < rk.g.haloed.y; ++y) {
+           for (int64_t x = 0; x < rk.g.haloed.x; ++x) {
+-            const size_t idx =
+-                static_cast<size_t>(c * rk.comp_stride + z * rk.g.pitch + y * rk.g.haloed.x + x);
++            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
++                                                   z * rk.g.pitch + y * rk.g.y_stride + x);
+             const uint64_t got = rk.buf[idx];
+             const bool owned = x >= rk.g.halo.x && x < rk.g.halo.x + rk.g.owned.x &&
+                                y >= rk.g.halo.y && y < rk.g.halo.y + rk.g.owned.y &&
+@@ -496,8 +500,8 @@
+               continue;
+             }
+             const Axis axis = halo_x ? Axis::X : (halo_y ? Axis::Y : Axis::Z);
+-            const size_t idx = static_cast<size_t>(c * rk.comp_stride + z * rk.g.pitch +
+-                                                   y * rk.g.haloed.x + x);
++            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
++                                                   z * rk.g.pitch + y * rk.g.y_stride + x);
+             const uint64_t marker =
+                 kMarker ^ (static_cast<uint64_t>(i + 1) << 40) ^ static_cast<uint64_t>(idx);
+             std::array<int64_t, 3> gw{};
+@@ -549,6 +553,7 @@
+   g.halo = {2, 1, 2};
+   g.haloed = {9, 8, 11};
+   g.pitch = g.haloed.x * g.haloed.y + 3;  // padded pitch: must not be assumed == x*y
++  g.y_stride = g.haloed.x;
+   const int comps = 70;                   // ~47 listed comps > kMaxPackComps: forces chunking
+   const int64_t cs = g.pitch * g.haloed.z;
+   std::vector<W> field(static_cast<size_t>(cs) * comps);
+@@ -581,7 +586,8 @@
+           for (int64_t y = 0; y < box.ext_y; ++y) {
+             for (int64_t x = 0; x < box.ext_x; ++x) {
+               const W expect = field[static_cast<size_t>(
+-                  c * cs + (box.lo_z + z) * g.pitch + (box.lo_y + y) * g.haloed.x + box.lo_x + x)];
++                  c * cs + g.lead_pad + (box.lo_z + z) * g.pitch +
++                  (box.lo_y + y) * g.y_stride + box.lo_x + x)];
+               CHECK(stage[n] == expect);
+               ++n;
+             }
+@@ -624,6 +630,7 @@
+     g.halo = {1, 1, 1};
+     g.haloed = {sh.ox + 2, sh.oy + 2, sh.oz + 2};
+     g.pitch = g.haloed.x * g.haloed.y;
++    g.y_stride = g.haloed.x;
+     const int64_t cs = g.pitch * g.haloed.z;
+     std::vector<uint32_t> field(static_cast<size_t>(cs) * static_cast<size_t>(sh.comps));
+     for (size_t i = 0; i < field.size(); ++i) {
+@@ -653,8 +660,8 @@
+           for (int64_t y = 0; y < box.ext_y; ++y) {
+             for (int64_t x = 0; x < box.ext_x; ++x) {
+               CHECK(stage[n] ==
+-                    field[static_cast<size_t>(c * cs + (box.lo_z + z) * g.pitch +
+-                                              (box.lo_y + y) * g.haloed.x + box.lo_x + x)]);
++                    field[static_cast<size_t>(c * cs + g.lead_pad + (box.lo_z + z) * g.pitch +
++                                              (box.lo_y + y) * g.y_stride + box.lo_x + x)]);
+               ++n;
+             }
+           }
+@@ -741,7 +748,10 @@
+     CHECK(eq3(ch.halo, halo));
+     CHECK(eq3(ch.haloed,
+               {ch.owned.x + 2 * halo.x, ch.owned.y + 2 * halo.y, ch.owned.z + 2 * halo.z}));
++    CHECK(ch.y_stride == ch.haloed.x);
++    CHECK(ch.lead_pad == 0);
+     CHECK(ch.xy_pitch == ch.haloed.x * ch.haloed.y);
++    CHECK(ch.component_stride == ch.xy_pitch * ch.haloed.z);
+ 
+     const dd::Span span(ch.haloed, global, ch.xy_pitch, ch.offset, ch.halo, bm,
+                         /*legacy_slab=*/legacy_slab);
+@@ -751,7 +761,9 @@
+     CHECK(eq3(span.offset(), ch.offset));
+     CHECK(eq3(span.global_extent(), global));
+     CHECK(span.xy_slab_elements() == ch.xy_pitch);
+-    CHECK(span.linear_storage_elements() == ch.xy_pitch * ch.haloed.z);
++    CHECK(span.y_stride() == ch.y_stride);
++    CHECK(span.lead_pad() == ch.lead_pad);
++    CHECK(span.linear_storage_elements() == ch.component_stride);
+ 
+     // Standard view: every owned cell once, mapped to the right global coordinate.
+     const int64_3d own0{sx.second, sy.second, sz.second};  // global coordinate of owned cell 0
+@@ -991,6 +1003,80 @@
+   return cases;
+ }
+ 
++auto
++part_b_padded_layout() -> size_t {
++  g_ctx = "part B padded layout";
++  const carbon::Stencil stencil(six(), /*remove_center=*/true);
++  const ProcessGrid pg = ProcessGrid::custom(8, 2, 2, 2);
++  const int64_3d global{19, 17, 23};
++  const int64_3d halo = dd::halo_extent(pg, BoundaryModeDistributed::Open, stencil);
++  const dd::LayoutOptions layout{true, 32, 64};
++  const auto round_up = [](int64_t value, int64_t alignment) {
++    return ((value + alignment - 1) / alignment) * alignment;
++  };
++
++  size_t cases = 0;
++  for (int32_t r = 0; r < pg.world_size(); ++r) {
++    const dd::RankChunk ch = dd::rank_chunk(global, pg, pg.coords_of(r), halo, layout);
++    CHECK(ch.y_stride == round_up(ch.haloed.x, layout.row_alignment));
++    CHECK(ch.lead_pad == (layout.row_alignment - (ch.halo.x % layout.row_alignment)) %
++                             layout.row_alignment);
++    CHECK(ch.xy_pitch == ch.y_stride * ch.haloed.y);
++    CHECK(ch.component_stride ==
++          round_up(ch.lead_pad + ch.haloed.z * ch.xy_pitch, layout.component_alignment));
++    CHECK(ch.component_stride >= ch.lead_pad + ch.haloed.z * ch.xy_pitch);
++
++    const dd::Span span(ch.haloed, global, ch.xy_pitch, ch.offset, ch.halo,
++                        BoundaryModeDistributed::Open, /*legacy_slab=*/false, {}, 1.0F, ch.y_stride,
++                        ch.component_stride, ch.lead_pad);
++    CHECK(span.y_stride() == ch.y_stride);
++    CHECK(span.lead_pad() == ch.lead_pad);
++    CHECK(span.linear_storage_elements() == ch.component_stride);
++
++    // The owned x == halo.x column must be row-aligned for every component.
++    for (int c = 0; c < 3; ++c) {
++      const int64_t off = span.linear_offset(span.make_idx(halo.x, halo.y, halo.z), c);
++      CHECK(off % layout.row_alignment == 0);
++    }
++    const int64_t base = span.linear_offset(span.make_idx(0, 0, 0), 0);
++    CHECK(span.linear_offset(span.make_idx(0, 1, 0), 0) - base == ch.y_stride);
++    CHECK(span.linear_offset(span.make_idx(0, 0, 1), 0) - base == ch.xy_pitch);
++
++    // Owned cells must not alias within a component plane.
++    std::vector<uint8_t> seen(static_cast<size_t>(ch.component_stride), 0U);
++    for (int64_t z = 0; z < ch.owned.z; ++z) {
++      for (int64_t y = 0; y < ch.owned.y; ++y) {
++        for (int64_t x = 0; x < ch.owned.x; ++x) {
++          const int64_t off =
++              span.linear_offset(span.make_idx(halo.x + x, halo.y + y, halo.z + z), 0);
++          CHECK(off >= 0 && off < ch.component_stride);
++          CHECK(seen[static_cast<size_t>(off)] == 0U);
++          seen[static_cast<size_t>(off)] = 1U;
++        }
++      }
++    }
++    ++cases;
++  }
++
++  const auto throws_invalid_argument = [](auto&& fn) -> bool {
++    try {
++      fn();
++    } catch (const std::invalid_argument&) {
++      return true;
++    } catch (...) {
++      return false;
++    }
++    return false;
++  };
++  CHECK(throws_invalid_argument([&] {
++    (void)dd::rank_chunk(global, pg, pg.coords_of(0), halo, dd::LayoutOptions{true, 0, 64});
++  }));
++  CHECK(throws_invalid_argument([&] {
++    (void)dd::rank_chunk(global, pg, pg.coords_of(0), halo, dd::LayoutOptions{true, 48, 64});
++  }));
++  return cases;
++}
++
+ // ------------------------------------------------------------------------------------------------
+ // Part D: VTK shard I/O for DenseDistributed.
+ // ------------------------------------------------------------------------------------------------
+@@ -1264,6 +1350,7 @@
+   int lattice_q;
+   int64_t pad;
+   bool lattice_distributed = false;
++  bool row_pad = false;
+ };
+ 
+ constexpr BoundaryModeDistributed kOpen = BoundaryModeDistributed::Open;
+@@ -1286,10 +1373,12 @@
+           std::to_string(s.pz) + " bm=" + std::to_string(static_cast<int>(s.bm)) +
+           " lat=" + std::to_string(s.lattice_q) +
+           " semantic=" + (s.lattice_distributed ? "lattice-distributed" : "lattice-or-standard") +
+-          " pad=" + std::to_string(s.pad);
++          " pad=" + std::to_string(s.pad) + " row_pad=" + (s.row_pad ? "true" : "false");
+   const ProcessGrid pg = ProcessGrid::custom(s.px * s.py * s.pz, s.px, s.py, s.pz);
++  const dd::LayoutOptions layout =
++      s.row_pad ? dd::LayoutOptions{true, 32, 64} : dd::LayoutOptions{};
+   World packed = make_world(pg, s.bm, {s.gx, s.gy, s.gz}, {s.hx, s.hy, s.hz}, s.comps,
+-                            s.lattice_q, s.lattice_distributed, s.pad);
++                            s.lattice_q, s.lattice_distributed, s.pad, layout);
+   World oracle = packed;  // identical start state
+ 
+   // Old path: run-based X, Y, Z.
+@@ -1341,9 +1430,10 @@
+   size_t geom_neighbours = 0;
+   const size_t geom_cases = part_b_geometry(geom_cells, geom_neighbours);
+   const size_t validation_cases = part_b_global_validation();
++  const size_t padded_layout_cases = part_b_padded_layout();
+   std::printf("geometry cases=%zu  owned cells checked=%zu  neighbour reads checked=%zu  "
+-              "global-validation cases=%zu\n",
+-              geom_cases, geom_cells, geom_neighbours, validation_cases);
++              "global-validation cases=%zu  padded-layout cases=%zu\n",
++              geom_cases, geom_cells, geom_neighbours, validation_cases, padded_layout_cases);
+ 
+   size_t vtk_shards = 0;
+   size_t vtk_empty = 0;
+@@ -1375,6 +1465,12 @@
+       sc.push_back({"d3q27", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5});
+       sc.push_back({"d3q19-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, true});
+       sc.push_back({"d3q27-dist-pad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5, true});
++      // Opt-in row/component padding: the packed and run-based paths must still agree.
++      sc.push_back({"std-h111-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 3, 0, 0, false,
++                    true});
++      sc.push_back({"d3q19-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, false, true});
++      sc.push_back({"d3q27-dist-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 0, true,
++                    true});
+     }
+   }
+ 

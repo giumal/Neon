@@ -144,6 +144,10 @@ private:
   std::vector<DistOp> ops_{};
   std::vector<size_t> first_elements_{};
   std::vector<size_t> counts_{};
+  // Byte-typed views of first_elements_/counts_, precomputed at construction so
+  // operator() does not allocate or re-convert on every halo exchange.
+  std::vector<size_t> first_bytes_{};
+  std::vector<size_t> byte_counts_{};
 };
 
 template <typename T>
@@ -160,6 +164,12 @@ inline DistTransfer<T>::DistTransfer(System system,
   ops_ = std::move(ops);
   first_elements_ = std::move(first_elements);
   counts_ = std::move(counts);
+  first_bytes_.resize(counts_.size());
+  byte_counts_.resize(counts_.size());
+  for (size_t i = 0; i < counts_.size(); ++i) {
+    first_bytes_[i] = first_elements_[i] * sizeof(T);
+    byte_counts_[i] = counts_[i] * sizeof(T);
+  }
 }
 
 template <typename T>

@@ -6238,3 +6238,10 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   `System::stream()` per call (the old reference raced the inline D-to-H copy on SYCL OpenMP).
   Verified with `test_skeleton_reduce_split`, `test_reduce_sum`, and `test_reduce_ops` on SYCL
   OpenMP, and with `test_skeleton_reduce_split` on CUDA.
+- **2026-11 — §3.5/§3.8 host and process-grid overhead reduced.** `DistTransfer` now
+  precomputes byte offsets/counts at construction instead of allocating two vectors per
+  exchange, and `HaloDistributed` only allocates/records cross-GPU fence events when more than
+  one local GPU is present. `ProcessGrid::make(world, mode, global_extent)` chooses the
+  factorisation that minimises the per-rank halo surface for the requested mode, preferring
+  pencil-like two-axis splits on ties; `DenseDistributed` uses it for `Pencil`/`Brick` and logs
+  the chosen dims on rank 0. Non-legacy slabs now use `stencil.radius3().z` for the z halo.

@@ -66,6 +66,18 @@ public:
        DecompositionMode mode) -> ProcessGrid;
 
   /**
+   * Extent-aware auto-factorization: choose a grid that satisfies @p mode and minimises the
+   * per-rank halo surface for @p global_extent. Falls back to @ref make(world_size, mode) when
+   * @p global_extent has a non-positive axis or no valid factorization exists.
+   *
+   * @throws std::invalid_argument if @p world_size <= 0, or @p mode is @c Custom.
+   */
+  [[nodiscard]] static auto
+  make(int32_t world_size,
+       DecompositionMode mode,
+       int64_3d global_extent) -> ProcessGrid;
+
+  /**
    * Build an exact @c (Px,Py,Pz) grid.
    *
    * @throws std::invalid_argument if @p world_size <= 0, any dimension is <= 0, or

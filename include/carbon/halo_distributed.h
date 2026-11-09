@@ -248,7 +248,7 @@ public:
     // genuine but contention-masked numerical drift, not just harness contention).
     // @c fence_event_ is empty for single-GPU / no-halo layouts, where the whole
     // block is skipped.
-    if (!fence_event_.empty()) {
+    if (field_.dense().system().gpu_group().size() > 1U && !fence_event_.empty()) {
       fence_event_.record(stream);
       stream.wait_for_all(fence_event_);
     }
@@ -274,7 +274,7 @@ public:
 #endif
 
         if (i + 1U < axis_passes_.size()) {
-          if (!pass.fence_event.empty()) {
+          if (field_.dense().system().gpu_group().size() > 1U && !pass.fence_event.empty()) {
             pass.fence_event.record(stream);
             stream.wait_for_all(pass.fence_event);
           }
@@ -532,6 +532,7 @@ HaloDistributed<T,
   const auto& spans = dense.spans();
   const auto& gpu_buffers = field_.gpu_buffers();
   const size_t n_gpus = spans.size();
+  const bool multi_local_gpu = dense.system().gpu_group().size() > 1U;
 
   // ---------- Phase 2: short-circuit on empty / no-halo layouts ----------
   if (n_gpus == 0U) {
@@ -795,7 +796,7 @@ HaloDistributed<T,
   // operator() skips the fence entirely. System::event() is non-const (it appends to
   // the System's event history), and dense.system() is a const ref, so take a shallow
   // System copy to allocate from.
-  if (intra_.src_counts().size() > 0U) {
+  if (multi_local_gpu && intra_.src_counts().size() > 0U) {
     System sys = dense.system();
     fence_event_ = sys.event();
   }
@@ -814,6 +815,7 @@ HaloDistributed<T,
   using detail::halo_distributed_build::AxisSide;
 
   const DenseDistributed& dense = field_.dense();
+  const bool multi_local_gpu = dense.system().gpu_group().size() > 1U;
   const ProcessGrid& pg = dense.process_grid();
   const auto& spans = dense.spans();
   const auto& gpu_buffers = field_.gpu_buffers();
@@ -1076,7 +1078,7 @@ HaloDistributed<T,
     pass.dist = dist.finalise(dense.system(), gpu_buffers);
 #endif
 
-    if (!pass.intra.src_counts().empty()) {
+    if (multi_local_gpu && !pass.intra.src_counts().empty()) {
       System sys = dense.system();
       pass.fence_event = sys.event();
     }
@@ -1093,7 +1095,7 @@ HaloDistributed<T,
   }
 
   for (const AxisPass& pass : axis_passes_) {
-    if (!pass.intra.src_counts().empty()) {
+    if (multi_local_gpu && !pass.intra.src_counts().empty()) {
       System sys = dense.system();
       fence_event_ = sys.event();
       break;
