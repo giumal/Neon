@@ -269,14 +269,14 @@ public:
                                                   Components> {
 #ifndef NDEBUG
     return Cursor<T, Components>{ptr_ + span.linear_offset(idx, 0),
-                                 static_cast<int32_t>(span.haloed_extent().x),
+                                 static_cast<int32_t>(span.y_stride()),
                                  static_cast<int32_t>(span.xy_slab_elements()),
                                  span.linear_storage_elements(),
                                  idx.cell(),
                                  span.haloed_extent()};
 #else
     return Cursor<T, Components>{
-        ptr_ + span.linear_offset(idx, 0), static_cast<int32_t>(span.haloed_extent().x),
+        ptr_ + span.linear_offset(idx, 0), static_cast<int32_t>(span.y_stride()),
         static_cast<int32_t>(span.xy_slab_elements()), span.linear_storage_elements()};
 #endif
   }

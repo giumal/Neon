@@ -33,6 +33,89 @@
 
 namespace carbon::detail::dense_distributed {
 
+/**
+ * Opt-in storage padding for @ref DenseDistributed spans.
+ *
+ * With @c pad_rows disabled (the default) the layout is exactly the historical one:
+ * @c y_stride == haloed.x, no lead pad, and @c component_stride == haloed.z * xy_pitch.
+ *
+ * With @c pad_rows enabled, each y row is rounded up to @p row_alignment elements, each component
+ * plane starts with a lead pad so buffer @c x == halo.x is @p row_alignment aligned, and the
+ * component stride is rounded up to @p component_alignment elements. Both alignments are in
+ * elements, not bytes; the defaults (32 and 64) are 128 B and 256 B for a 4-byte element such as
+ * the fp32 LBM populations. @p component_alignment must be a multiple of @p row_alignment.
+ */
+struct LayoutOptions {
+  bool pad_rows{false};
+  int64_t row_alignment{32};
+  int64_t component_alignment{64};
+};
+
+/** Round @p value up to the next multiple of @p alignment (which must be positive). */
+[[nodiscard]] inline auto
+round_up(int64_t value, int64_t alignment) -> int64_t {
+  if (alignment <= 0) {
+    carbon::log::throw_with_log<std::invalid_argument>(
+        "DenseDistributed: storage alignment must be positive (alignment={})", alignment);
+  }
+  if (value < 0) {
+    carbon::log::throw_with_log<std::invalid_argument>(
+        "DenseDistributed: cannot round a negative extent (value={})", value);
+  }
+  const int64_t remainder = value % alignment;
+  if (remainder == 0) {
+    return value;
+  }
+  const int64_t delta = alignment - remainder;
+  if (value > std::numeric_limits<int64_t>::max() - delta) {
+    carbon::log::throw_with_log<std::overflow_error>(
+        "DenseDistributed: padded storage extent overflows int64 (value={}, alignment={})", value,
+        alignment);
+  }
+  return value + delta;
+}
+
+/** Per-component storage strides derived from an extent and @ref LayoutOptions. */
+struct StoragePadding {
+  int64_t y_stride{};
+  int64_t lead_pad{};
+  int64_t xy_pitch{};
+  int64_t component_stride{};
+};
+
+/**
+ * Compute the padded storage layout for @p haloed / @p halo. The returned offsets are all in
+ * elements. The default @ref LayoutOptions reproduces the historical unpadded layout exactly.
+ */
+[[nodiscard]] inline auto
+storage_padding(const int64_3d& haloed,
+                const int64_3d& halo,
+                const LayoutOptions& layout = {}) -> StoragePadding {
+  StoragePadding p;
+  p.y_stride = haloed.x;
+  p.lead_pad = 0;
+  p.xy_pitch = haloed.x * haloed.y;
+  p.component_stride = haloed.z * p.xy_pitch;
+  if (!layout.pad_rows) {
+    return p;
+  }
+  if (layout.row_alignment <= 0 || layout.component_alignment <= 0) {
+    carbon::log::throw_with_log<std::invalid_argument>(
+        "DenseDistributed: storage alignments must be positive (row={}, component={})",
+        layout.row_alignment, layout.component_alignment);
+  }
+  if (layout.component_alignment % layout.row_alignment != 0) {
+    carbon::log::throw_with_log<std::invalid_argument>(
+        "DenseDistributed: component_alignment ({}) must be a multiple of row_alignment ({})",
+        layout.component_alignment, layout.row_alignment);
+  }
+  p.y_stride = round_up(haloed.x, layout.row_alignment);
+  p.lead_pad = (layout.row_alignment - (halo.x % layout.row_alignment)) % layout.row_alignment;
+  p.xy_pitch = p.y_stride * haloed.y;
+  p.component_stride = round_up(p.lead_pad + haloed.z * p.xy_pitch, layout.component_alignment);
+  return p;
+}
+
 /** Split @p n layers over @p num_parts coordinates as evenly as possible (earlier ones get +1). */
 [[nodiscard]] inline auto
 split_extent(int64_t n,
@@ -131,8 +214,14 @@ struct RankChunk {
   int64_3d halo{};
   /** Storage extent: owned + 2 * halo on each axis. */
   int64_3d haloed{};
-  /** Elements per XY plane (@c haloed.x * haloed.y). */
+  /** Elements between adjacent y rows; @c haloed.x when row padding is disabled. */
+  int64_t y_stride{};
+  /** Elements per XY plane, including row padding when enabled. */
   int64_t xy_pitch{};
+  /** Elements per component plane, including lead pad and tail padding. */
+  int64_t component_stride{};
+  /** Elements before buffer @c x == 0 in each component plane. */
+  int64_t lead_pad{};
 };
 
 /** Chunk owned by process coordinate @p coords of @p pg over @p global, with halo @p halo. */
@@ -140,7 +229,8 @@ struct RankChunk {
 rank_chunk(const int64_3d& global,
            const ProcessGrid& pg,
            int32_3d coords,
-           const int64_3d& halo) -> RankChunk {
+           const int64_3d& halo,
+           const LayoutOptions& layout = {}) -> RankChunk {
   const int32_3d dims = pg.dims();
   const auto locate = [](int64_t n, int32_t parts, int32_t coord) -> std::pair<int64_t, int64_t> {
     const std::vector<size_t> counts = split_extent(n, static_cast<size_t>(parts));
@@ -159,7 +249,11 @@ rank_chunk(const int64_3d& global,
   c.halo = halo;
   c.offset = {ox - halo.x, oy - halo.y, oz - halo.z};
   c.haloed = {nx + 2 * halo.x, ny + 2 * halo.y, nz + 2 * halo.z};
-  c.xy_pitch = c.haloed.x * c.haloed.y;
+  const StoragePadding padding = storage_padding(c.haloed, c.halo, layout);
+  c.y_stride = padding.y_stride;
+  c.xy_pitch = padding.xy_pitch;
+  c.component_stride = padding.component_stride;
+  c.lead_pad = padding.lead_pad;
   return c;
 }
 

@@ -44,11 +44,11 @@ struct VtkBoxPieceT {
   int64_t nx{0};
   int64_t ny{0};
   int64_t nz{0};
-  /** Elements between consecutive rows (the haloed x extent). */
+  /** Elements between consecutive rows (the span's y stride, including row padding). */
   int64_t row_stride{0};
-  /** Elements between consecutive z planes. */
+  /** Elements between consecutive z planes (including row padding). */
   int64_t plane_pitch{0};
-  /** Elements between consecutive components. */
+  /** Elements between consecutive components (including lead and tail padding). */
   int64_t comp_stride{0};
 };
 using VtkBoxPiece = VtkBoxPieceT<const void*>;
@@ -202,14 +202,14 @@ collect_vtk_pieces(const DenseDistributed& grid,
     }
     const int64_3d halo = span.halo();
     VtkBoxPiece p;
-    p.row_stride = span.haloed_extent().x;
+    p.row_stride = span.y_stride();
     p.plane_pitch = span.xy_slab_elements();
     p.comp_stride = span.linear_storage_elements();
     p.nx = owned.x;
     p.ny = owned.y;
     p.nz = owned.z;
-    p.start = static_cast<const void*>(field.cpu_buffers()[g].data() + halo.z * p.plane_pitch +
-                                       halo.y * p.row_stride + halo.x);
+    p.start = static_cast<const void*>(field.cpu_buffers()[g].data() + span.lead_pad() +
+                                       halo.z * p.plane_pitch + halo.y * p.row_stride + halo.x);
     pieces.push_back(p);
   }
 }
@@ -238,14 +238,14 @@ collect_vtk_pieces_mut(const DenseDistributed& grid,
     }
     const int64_3d halo = span.halo();
     VtkBoxPieceMut p;
-    p.row_stride = span.haloed_extent().x;
+    p.row_stride = span.y_stride();
     p.plane_pitch = span.xy_slab_elements();
     p.comp_stride = span.linear_storage_elements();
     p.nx = owned.x;
     p.ny = owned.y;
     p.nz = owned.z;
-    p.start = static_cast<void*>(field.cpu_buffers()[g].data() + halo.z * p.plane_pitch +
-                                 halo.y * p.row_stride + halo.x);
+    p.start = static_cast<void*>(field.cpu_buffers()[g].data() + span.lead_pad() +
+                                 halo.z * p.plane_pitch + halo.y * p.row_stride + halo.x);
     pieces.push_back(p);
   }
 }

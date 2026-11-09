@@ -690,15 +690,18 @@ HaloDistributed<T,
       const int64_t lim_z_lo = span_lo.logic_extent().z;
       const int64_t per_comp_lo = span_lo.linear_storage_elements();
       const int64_t per_comp_up = span_up.linear_storage_elements();
+      const int64_t lead_pad_lo = span_lo.lead_pad();
+      const int64_t lead_pad_up = span_up.lead_pad();
 
       for (int c = 0; c < Components; ++c) {
         const size_t cc = static_cast<size_t>(c);
         // Upward: slab g_lo's last halo_z owned -> slab g_up's lower halo. Skipped under
         // lattice semantic when stencil[c].z <= 0.
         if (active_up(c)) {
-          const size_t up_src_off =
-              cc * static_cast<size_t>(per_comp_lo) + static_cast<size_t>(lim_z_lo * pitch);
-          const size_t up_dst_off = cc * static_cast<size_t>(per_comp_up);
+          const size_t up_src_off = cc * static_cast<size_t>(per_comp_lo) +
+                                    static_cast<size_t>(lead_pad_lo + lim_z_lo * pitch);
+          const size_t up_dst_off =
+              cc * static_cast<size_t>(per_comp_up) + static_cast<size_t>(lead_pad_up);
           if (has_gpu_buffers) {
             intra.push(gpu_buffers[i_lo], gpu_buffers[i_up], up_src_off, up_dst_off, halo_count);
           }
@@ -708,10 +711,10 @@ HaloDistributed<T,
         // Downward: slab g_up's first halo_z owned -> slab g_lo's upper halo. Skipped under
         // lattice semantic when stencil[c].z >= 0.
         if (active_down(c)) {
-          const size_t dn_src_off =
-              cc * static_cast<size_t>(per_comp_up) + static_cast<size_t>(halo_z * pitch);
+          const size_t dn_src_off = cc * static_cast<size_t>(per_comp_up) +
+                                    static_cast<size_t>(lead_pad_up + halo_z * pitch);
           const size_t dn_dst_off = cc * static_cast<size_t>(per_comp_lo) +
-                                    static_cast<size_t>((halo_z + lim_z_lo) * pitch);
+                                    static_cast<size_t>(lead_pad_lo + (halo_z + lim_z_lo) * pitch);
           if (has_gpu_buffers) {
             intra.push(gpu_buffers[i_up], gpu_buffers[i_lo], dn_src_off, dn_dst_off, halo_count);
           }
@@ -746,15 +749,16 @@ HaloDistributed<T,
     const auto& span = spans[i_local];
     const int64_t lim_z = span.logic_extent().z;
     const int64_t per_comp = span.linear_storage_elements();
+    const int64_t lead_pad = span.lead_pad();
 
     // lo_local: we are the LOWER of the pair, peer is above us. Send our last halo_z owned,
     //           Recv into our upper halo.
     // up_local: we are the UPPER of the pair, peer is below us. Send our first halo_z owned,
     //           Recv into our lower halo.
-    const size_t send_offset_base =
-        lo_local ? static_cast<size_t>(lim_z * pitch) : static_cast<size_t>(halo_z * pitch);
-    const size_t recv_offset_base =
-        lo_local ? static_cast<size_t>((halo_z + lim_z) * pitch) : static_cast<size_t>(0);
+    const size_t send_offset_base = static_cast<size_t>(
+        lead_pad + (lo_local ? lim_z * pitch : halo_z * pitch));
+    const size_t recv_offset_base = static_cast<size_t>(
+        lead_pad + (lo_local ? (halo_z + lim_z) * pitch : 0));
 
     // Lattice activity. lo_local sends "upward" populations (c.z > 0) and receives
     // "downward" populations (c.z < 0); up_local is the mirror.
@@ -836,6 +840,8 @@ HaloDistributed<T,
         s.halo(),
         s.haloed_extent(),
         s.xy_slab_elements(),
+        s.y_stride(),
+        s.lead_pad(),
     };
   };
 

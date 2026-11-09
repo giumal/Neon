@@ -200,7 +200,8 @@ make_world(const ProcessGrid& pg,
            int comps,
            int lattice_q,
            bool lattice_distributed,
-           int64_t pitch_pad) -> World {
+           int64_t pitch_pad,
+           const dd::LayoutOptions& layout = {}) -> World {
   World w;
   w.pg = pg;
   w.bm = bm;
@@ -217,7 +218,7 @@ make_world(const ProcessGrid& pg,
     rk.coords = pg.coords_of(r);
     // Geometry comes from the production layout functions, so Part C exercises the real
     // decomposition (not a second copy of it).
-    const dd::RankChunk chunk = dd::rank_chunk(global, pg, rk.coords, hh);
+    const dd::RankChunk chunk = dd::rank_chunk(global, pg, rk.coords, hh, layout);
     rk.offset = {chunk.offset.x + hh.x, chunk.offset.y + hh.y, chunk.offset.z + hh.z};
     const auto sx = std::pair<int64_t, int64_t>{chunk.owned.x, rk.offset.x};
     const auto sy = std::pair<int64_t, int64_t>{chunk.owned.y, rk.offset.y};
@@ -225,8 +226,10 @@ make_world(const ProcessGrid& pg,
     rk.g.owned = chunk.owned;
     rk.g.halo = hh;
     rk.g.haloed = chunk.haloed;
-    rk.g.pitch = rk.g.haloed.x * rk.g.haloed.y + pitch_pad;
-    rk.comp_stride = rk.g.pitch * rk.g.haloed.z;
+    rk.g.pitch = chunk.xy_pitch + pitch_pad;
+    rk.g.y_stride = chunk.y_stride;
+    rk.g.lead_pad = chunk.lead_pad;
+    rk.comp_stride = chunk.component_stride + pitch_pad * rk.g.haloed.z;
     rk.buf.assign(static_cast<size_t>(rk.comp_stride) * static_cast<size_t>(w.comps), kSentinel);
     // Stand-in for user boundary-condition data living in exterior halo cells: a value unique to
     // (rank, cell) so any stray overwrite is visible. Cells that a correct exchange fills get
@@ -238,8 +241,9 @@ make_world(const ProcessGrid& pg,
       for (int64_t z = 0; z < sz.first; ++z) {
         for (int64_t y = 0; y < sy.first; ++y) {
           for (int64_t x = 0; x < sx.first; ++x) {
-            const size_t idx = static_cast<size_t>(c * rk.comp_stride + (z + hh.z) * rk.g.pitch +
-                                                   (y + hh.y) * rk.g.haloed.x + (x + hh.x));
+            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
+                                                   (z + hh.z) * rk.g.pitch +
+                                                   (y + hh.y) * rk.g.y_stride + (x + hh.x));
             rk.buf[idx] = encode(rk.offset.x + x, rk.offset.y + y, rk.offset.z + z, c);
           }
         }
@@ -432,8 +436,8 @@ verify(const World& w,
       for (int64_t z = 0; z < rk.g.haloed.z; ++z) {
         for (int64_t y = 0; y < rk.g.haloed.y; ++y) {
           for (int64_t x = 0; x < rk.g.haloed.x; ++x) {
-            const size_t idx =
-                static_cast<size_t>(c * rk.comp_stride + z * rk.g.pitch + y * rk.g.haloed.x + x);
+            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
+                                                   z * rk.g.pitch + y * rk.g.y_stride + x);
             const uint64_t got = rk.buf[idx];
             const bool owned = x >= rk.g.halo.x && x < rk.g.halo.x + rk.g.owned.x &&
                                y >= rk.g.halo.y && y < rk.g.halo.y + rk.g.owned.y &&
@@ -496,8 +500,8 @@ verify_lattice_distributed_faces(const World& w) -> size_t {
               continue;
             }
             const Axis axis = halo_x ? Axis::X : (halo_y ? Axis::Y : Axis::Z);
-            const size_t idx = static_cast<size_t>(c * rk.comp_stride + z * rk.g.pitch +
-                                                   y * rk.g.haloed.x + x);
+            const size_t idx = static_cast<size_t>(c * rk.comp_stride + rk.g.lead_pad +
+                                                   z * rk.g.pitch + y * rk.g.y_stride + x);
             const uint64_t marker =
                 kMarker ^ (static_cast<uint64_t>(i + 1) << 40) ^ static_cast<uint64_t>(idx);
             std::array<int64_t, 3> gw{};
@@ -549,6 +553,7 @@ part_a_roundtrip() -> void {
   g.halo = {2, 1, 2};
   g.haloed = {9, 8, 11};
   g.pitch = g.haloed.x * g.haloed.y + 3;  // padded pitch: must not be assumed == x*y
+  g.y_stride = g.haloed.x;
   const int comps = 70;                   // ~47 listed comps > kMaxPackComps: forces chunking
   const int64_t cs = g.pitch * g.haloed.z;
   std::vector<W> field(static_cast<size_t>(cs) * comps);
@@ -581,7 +586,8 @@ part_a_roundtrip() -> void {
           for (int64_t y = 0; y < box.ext_y; ++y) {
             for (int64_t x = 0; x < box.ext_x; ++x) {
               const W expect = field[static_cast<size_t>(
-                  c * cs + (box.lo_z + z) * g.pitch + (box.lo_y + y) * g.haloed.x + box.lo_x + x)];
+                  c * cs + g.lead_pad + (box.lo_z + z) * g.pitch +
+                  (box.lo_y + y) * g.y_stride + box.lo_x + x)];
               CHECK(stage[n] == expect);
               ++n;
             }
@@ -624,6 +630,7 @@ part_a_launch_shapes() -> void {
     g.halo = {1, 1, 1};
     g.haloed = {sh.ox + 2, sh.oy + 2, sh.oz + 2};
     g.pitch = g.haloed.x * g.haloed.y;
+    g.y_stride = g.haloed.x;
     const int64_t cs = g.pitch * g.haloed.z;
     std::vector<uint32_t> field(static_cast<size_t>(cs) * static_cast<size_t>(sh.comps));
     for (size_t i = 0; i < field.size(); ++i) {
@@ -653,8 +660,8 @@ part_a_launch_shapes() -> void {
           for (int64_t y = 0; y < box.ext_y; ++y) {
             for (int64_t x = 0; x < box.ext_x; ++x) {
               CHECK(stage[n] ==
-                    field[static_cast<size_t>(c * cs + (box.lo_z + z) * g.pitch +
-                                              (box.lo_y + y) * g.haloed.x + box.lo_x + x)]);
+                    field[static_cast<size_t>(c * cs + g.lead_pad + (box.lo_z + z) * g.pitch +
+                                              (box.lo_y + y) * g.y_stride + box.lo_x + x)]);
               ++n;
             }
           }
@@ -741,7 +748,10 @@ check_geometry(const GeomCase& c,
     CHECK(eq3(ch.halo, halo));
     CHECK(eq3(ch.haloed,
               {ch.owned.x + 2 * halo.x, ch.owned.y + 2 * halo.y, ch.owned.z + 2 * halo.z}));
+    CHECK(ch.y_stride == ch.haloed.x);
+    CHECK(ch.lead_pad == 0);
     CHECK(ch.xy_pitch == ch.haloed.x * ch.haloed.y);
+    CHECK(ch.component_stride == ch.xy_pitch * ch.haloed.z);
 
     const dd::Span span(ch.haloed, global, ch.xy_pitch, ch.offset, ch.halo, bm,
                         /*legacy_slab=*/legacy_slab);
@@ -751,7 +761,9 @@ check_geometry(const GeomCase& c,
     CHECK(eq3(span.offset(), ch.offset));
     CHECK(eq3(span.global_extent(), global));
     CHECK(span.xy_slab_elements() == ch.xy_pitch);
-    CHECK(span.linear_storage_elements() == ch.xy_pitch * ch.haloed.z);
+    CHECK(span.y_stride() == ch.y_stride);
+    CHECK(span.lead_pad() == ch.lead_pad);
+    CHECK(span.linear_storage_elements() == ch.component_stride);
 
     // Standard view: every owned cell once, mapped to the right global coordinate.
     const int64_3d own0{sx.second, sy.second, sz.second};  // global coordinate of owned cell 0
@@ -988,6 +1000,80 @@ part_b_global_validation() -> size_t {
     }));
     ++cases;
   }
+  return cases;
+}
+
+auto
+part_b_padded_layout() -> size_t {
+  g_ctx = "part B padded layout";
+  const carbon::Stencil stencil(six(), /*remove_center=*/true);
+  const ProcessGrid pg = ProcessGrid::custom(8, 2, 2, 2);
+  const int64_3d global{19, 17, 23};
+  const int64_3d halo = dd::halo_extent(pg, BoundaryModeDistributed::Open, stencil);
+  const dd::LayoutOptions layout{true, 32, 64};
+  const auto round_up = [](int64_t value, int64_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+  };
+
+  size_t cases = 0;
+  for (int32_t r = 0; r < pg.world_size(); ++r) {
+    const dd::RankChunk ch = dd::rank_chunk(global, pg, pg.coords_of(r), halo, layout);
+    CHECK(ch.y_stride == round_up(ch.haloed.x, layout.row_alignment));
+    CHECK(ch.lead_pad == (layout.row_alignment - (ch.halo.x % layout.row_alignment)) %
+                             layout.row_alignment);
+    CHECK(ch.xy_pitch == ch.y_stride * ch.haloed.y);
+    CHECK(ch.component_stride ==
+          round_up(ch.lead_pad + ch.haloed.z * ch.xy_pitch, layout.component_alignment));
+    CHECK(ch.component_stride >= ch.lead_pad + ch.haloed.z * ch.xy_pitch);
+
+    const dd::Span span(ch.haloed, global, ch.xy_pitch, ch.offset, ch.halo,
+                        BoundaryModeDistributed::Open, /*legacy_slab=*/false, {}, 1.0F, ch.y_stride,
+                        ch.component_stride, ch.lead_pad);
+    CHECK(span.y_stride() == ch.y_stride);
+    CHECK(span.lead_pad() == ch.lead_pad);
+    CHECK(span.linear_storage_elements() == ch.component_stride);
+
+    // The owned x == halo.x column must be row-aligned for every component.
+    for (int c = 0; c < 3; ++c) {
+      const int64_t off = span.linear_offset(span.make_idx(halo.x, halo.y, halo.z), c);
+      CHECK(off % layout.row_alignment == 0);
+    }
+    const int64_t base = span.linear_offset(span.make_idx(0, 0, 0), 0);
+    CHECK(span.linear_offset(span.make_idx(0, 1, 0), 0) - base == ch.y_stride);
+    CHECK(span.linear_offset(span.make_idx(0, 0, 1), 0) - base == ch.xy_pitch);
+
+    // Owned cells must not alias within a component plane.
+    std::vector<uint8_t> seen(static_cast<size_t>(ch.component_stride), 0U);
+    for (int64_t z = 0; z < ch.owned.z; ++z) {
+      for (int64_t y = 0; y < ch.owned.y; ++y) {
+        for (int64_t x = 0; x < ch.owned.x; ++x) {
+          const int64_t off =
+              span.linear_offset(span.make_idx(halo.x + x, halo.y + y, halo.z + z), 0);
+          CHECK(off >= 0 && off < ch.component_stride);
+          CHECK(seen[static_cast<size_t>(off)] == 0U);
+          seen[static_cast<size_t>(off)] = 1U;
+        }
+      }
+    }
+    ++cases;
+  }
+
+  const auto throws_invalid_argument = [](auto&& fn) -> bool {
+    try {
+      fn();
+    } catch (const std::invalid_argument&) {
+      return true;
+    } catch (...) {
+      return false;
+    }
+    return false;
+  };
+  CHECK(throws_invalid_argument([&] {
+    (void)dd::rank_chunk(global, pg, pg.coords_of(0), halo, dd::LayoutOptions{true, 0, 64});
+  }));
+  CHECK(throws_invalid_argument([&] {
+    (void)dd::rank_chunk(global, pg, pg.coords_of(0), halo, dd::LayoutOptions{true, 48, 64});
+  }));
   return cases;
 }
 
@@ -1264,6 +1350,7 @@ struct Scenario {
   int lattice_q;
   int64_t pad;
   bool lattice_distributed = false;
+  bool row_pad = false;
 };
 
 constexpr BoundaryModeDistributed kOpen = BoundaryModeDistributed::Open;
@@ -1286,10 +1373,12 @@ run_scenario(const Scenario& s,
           std::to_string(s.pz) + " bm=" + std::to_string(static_cast<int>(s.bm)) +
           " lat=" + std::to_string(s.lattice_q) +
           " semantic=" + (s.lattice_distributed ? "lattice-distributed" : "lattice-or-standard") +
-          " pad=" + std::to_string(s.pad);
+          " pad=" + std::to_string(s.pad) + " row_pad=" + (s.row_pad ? "true" : "false");
   const ProcessGrid pg = ProcessGrid::custom(s.px * s.py * s.pz, s.px, s.py, s.pz);
+  const dd::LayoutOptions layout =
+      s.row_pad ? dd::LayoutOptions{true, 32, 64} : dd::LayoutOptions{};
   World packed = make_world(pg, s.bm, {s.gx, s.gy, s.gz}, {s.hx, s.hy, s.hz}, s.comps,
-                            s.lattice_q, s.lattice_distributed, s.pad);
+                            s.lattice_q, s.lattice_distributed, s.pad, layout);
   World oracle = packed;  // identical start state
 
   // Old path: run-based X, Y, Z.
@@ -1341,9 +1430,10 @@ main() {
   size_t geom_neighbours = 0;
   const size_t geom_cases = part_b_geometry(geom_cells, geom_neighbours);
   const size_t validation_cases = part_b_global_validation();
+  const size_t padded_layout_cases = part_b_padded_layout();
   std::printf("geometry cases=%zu  owned cells checked=%zu  neighbour reads checked=%zu  "
-              "global-validation cases=%zu\n",
-              geom_cases, geom_cells, geom_neighbours, validation_cases);
+              "global-validation cases=%zu  padded-layout cases=%zu\n",
+              geom_cases, geom_cells, geom_neighbours, validation_cases, padded_layout_cases);
 
   size_t vtk_shards = 0;
   size_t vtk_empty = 0;
@@ -1375,6 +1465,12 @@ main() {
       sc.push_back({"d3q27", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5});
       sc.push_back({"d3q19-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, true});
       sc.push_back({"d3q27-dist-pad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5, true});
+      // Opt-in row/component padding: the packed and run-based paths must still agree.
+      sc.push_back({"std-h111-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 3, 0, 0, false,
+                    true});
+      sc.push_back({"d3q19-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, false, true});
+      sc.push_back({"d3q27-dist-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 0, true,
+                    true});
     }
   }
 

@@ -10,7 +10,9 @@
  * (with periodic wrap). They are pure host-side index arithmetic: no device state, no MPI.
  *
  * Storage addressing (matches @c DenseDistributed::Span): element @c (x, y, z) of one component
- * lives at @c z * pitch + y * haloed.x + x, where @c pitch is the number of elements per XY plane.
+ * lives at @c lead_pad + z * pitch + y * y_stride + x, where @c pitch is the number of elements per
+ * XY plane. @c y_stride is @c haloed.x for the historical unpadded layout and larger when row
+ * padding is enabled.
  *
  * Kept apart from @c halo_build.h so the Z-slab @ref Halo keeps its original helper set untouched.
  */
@@ -44,6 +46,10 @@ struct AxisGeometry {
   int64_3d halo{};
   int64_3d haloed{};
   int64_t pitch{};
+  /** Elements between adjacent y rows; 0 means "use haloed.x" (unpadded compatibility). */
+  int64_t y_stride{};
+  /** Elements before buffer x == 0 in each component plane. */
+  int64_t lead_pad{};
 };
 
 struct AxisRun {
@@ -114,6 +120,7 @@ axis_halo_runs(const AxisGeometry& g,
                AxisSide side) -> std::vector<AxisRun> {
   std::vector<AxisRun> runs;
 
+  const int64_t y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
   const int64_t owned = axis_value(g.owned, axis);
   const int64_t halo = axis_value(g.halo, axis);
   if (halo <= 0) {
@@ -133,7 +140,8 @@ axis_halo_runs(const AxisGeometry& g,
       for (int64_t z = 0; z < g.haloed.z; ++z) {
         for (int64_t y = 0; y < g.haloed.y; ++y) {
           runs.push_back({
-              static_cast<size_t>(z * g.pitch + y * g.haloed.x) + static_cast<size_t>(start),
+              static_cast<size_t>(g.lead_pad + z * g.pitch + y * y_stride) +
+                  static_cast<size_t>(start),
               count,
           });
         }
@@ -142,8 +150,9 @@ axis_halo_runs(const AxisGeometry& g,
     }
 
     case Axis::Y: {
-      const int64_t start = (side == AxisSide::Lower ? 0 : g.halo.y + g.owned.y) * g.haloed.x;
-      const size_t count = static_cast<size_t>(g.halo.y * g.haloed.x);
+      const int64_t start =
+          g.lead_pad + (side == AxisSide::Lower ? 0 : g.halo.y + g.owned.y) * y_stride;
+      const size_t count = static_cast<size_t>(g.halo.y * y_stride);
       runs.reserve(static_cast<size_t>(g.haloed.z));
       for (int64_t z = 0; z < g.haloed.z; ++z) {
         runs.push_back({
@@ -155,7 +164,8 @@ axis_halo_runs(const AxisGeometry& g,
     }
 
     case Axis::Z: {
-      const int64_t start = (side == AxisSide::Lower ? 0 : g.halo.z + g.owned.z) * g.pitch;
+      const int64_t start =
+          g.lead_pad + (side == AxisSide::Lower ? 0 : g.halo.z + g.owned.z) * g.pitch;
       const size_t count = static_cast<size_t>(g.halo.z * g.pitch);
       runs.push_back({
           static_cast<size_t>(start),
@@ -174,6 +184,7 @@ axis_owned_face_runs(const AxisGeometry& g,
                      AxisSide side) -> std::vector<AxisRun> {
   std::vector<AxisRun> runs;
 
+  const int64_t y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
   const int64_t owned = axis_value(g.owned, axis);
   const int64_t halo = axis_value(g.halo, axis);
   if (halo <= 0) {
@@ -193,7 +204,8 @@ axis_owned_face_runs(const AxisGeometry& g,
       for (int64_t z = 0; z < g.haloed.z; ++z) {
         for (int64_t y = 0; y < g.haloed.y; ++y) {
           runs.push_back({
-              static_cast<size_t>(z * g.pitch + y * g.haloed.x) + static_cast<size_t>(start),
+              static_cast<size_t>(g.lead_pad + z * g.pitch + y * y_stride) +
+                  static_cast<size_t>(start),
               count,
           });
         }
@@ -202,8 +214,9 @@ axis_owned_face_runs(const AxisGeometry& g,
     }
 
     case Axis::Y: {
-      const int64_t start = (side == AxisSide::Lower ? g.halo.y : g.owned.y) * g.haloed.x;
-      const size_t count = static_cast<size_t>(g.halo.y * g.haloed.x);
+      const int64_t start =
+          g.lead_pad + (side == AxisSide::Lower ? g.halo.y : g.owned.y) * y_stride;
+      const size_t count = static_cast<size_t>(g.halo.y * y_stride);
       runs.reserve(static_cast<size_t>(g.haloed.z));
       for (int64_t z = 0; z < g.haloed.z; ++z) {
         runs.push_back({
@@ -215,7 +228,7 @@ axis_owned_face_runs(const AxisGeometry& g,
     }
 
     case Axis::Z: {
-      const int64_t start = (side == AxisSide::Lower ? g.halo.z : g.owned.z) * g.pitch;
+      const int64_t start = g.lead_pad + (side == AxisSide::Lower ? g.halo.z : g.owned.z) * g.pitch;
       const size_t count = static_cast<size_t>(g.halo.z * g.pitch);
       runs.push_back({
           static_cast<size_t>(start),

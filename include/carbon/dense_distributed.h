@@ -3,6 +3,7 @@
 #include <carbon/boundary_mode_distributed.h>
 #include <carbon/data_view.h>
 #include <carbon/detail/dense_distributed/kernel.h>
+#include <carbon/detail/dense_distributed/layout.h>
 #include <carbon/detail/dense_distributed/partition.h>
 #include <carbon/detail/dense_distributed/span.h>
 #include <carbon/export.h>
@@ -81,6 +82,8 @@ class CARBON_API DenseDistributed {
 public:
   /** Per-GPU chunk layout (alias of @c detail::dense_distributed::Span). */
   using Span = detail::dense_distributed::Span;
+  /** Opt-in storage-padding knobs (alias of @c detail::dense_distributed::LayoutOptions). */
+  using LayoutOptions = detail::dense_distributed::LayoutOptions;
   /** Cell index for dense kernels (alias of @c detail::dense_distributed::Idx). */
   using Idx = detail::dense_distributed::Idx;
 
@@ -122,6 +125,9 @@ public:
    * @param block_override When set, used as the CUDA/SYCL launch block for every local GPU
    *                      instead of @c dense_make_kernel_block(). The matching launch grid
    *                      is derived via @c compute_dense_grid for each @ref DataView.
+   * @param layout        Opt-in storage padding. The default keeps the historical compact
+   *                      layout; @c LayoutOptions{.pad_rows=true} rounds row and component
+   *                      pitches for better coalescing on the device.
    */
   DenseDistributed(System system,
                    int64_3d global_extent,
@@ -129,7 +135,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   LayoutOptions layout = {});
 
   /**
    * @brief Build a layout by auto-factorizing the world size for @p decomposition.
@@ -144,7 +151,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   LayoutOptions layout = {});
 
   /**
    * @brief Build a layout from an explicit @p process_grid.
@@ -159,7 +167,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   LayoutOptions layout = {});
 
   /**
    * @brief Default-construct an empty grid: zero global extent, default
@@ -590,7 +599,8 @@ private:
                float32_3d origin,
                float spacing,
                ProcessGrid process_grid,
-               std::optional<LaunchShape> block_override);
+               std::optional<LaunchShape> block_override,
+               LayoutOptions layout);
 
   ProcessGrid process_grid_{};
 };

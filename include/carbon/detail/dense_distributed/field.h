@@ -288,6 +288,8 @@ public:
       const auto owned = span.logic_extent();
       const auto halo = span.halo();
       const int64_t pitch = span.xy_slab_elements();
+      const int64_t y_stride = span.y_stride();
+      const int64_t lead_pad = span.lead_pad();
       const int64_t x_origin = span.x_offset();
       const int64_t y_origin = span.y_offset();
       const int64_t z_origin = span.z_offset();
@@ -302,7 +304,7 @@ public:
           for (int64_t y = halo.y; y < halo.y + owned.y; ++y) {
             const int64_t global_y = y_origin + y;
             for (int64_t x = halo.x; x < halo.x + owned.x; ++x) {
-              const int64_t off = plane + z * pitch + y * haloed.x + x;
+              const int64_t off = plane + lead_pad + z * pitch + y * y_stride + x;
               h[off] = static_cast<T>(fn(::carbon::int64_3d(x_origin + x, global_y, global_z), c));
             }
           }
@@ -356,6 +358,8 @@ public:
       const auto& span = spans[g];
       const auto haloed = span.haloed_extent();
       const int64_t pitch = span.xy_slab_elements();
+      const int64_t y_stride = span.y_stride();
+      const int64_t lead_pad = span.lead_pad();
       const int64_t x_origin = span.x_offset();
       const int64_t y_origin = span.y_offset();
       const int64_t z_origin = span.z_offset();
@@ -370,7 +374,7 @@ public:
           for (int64_t y = 0; y < haloed.y; ++y) {
             const int64_t global_y = y_origin + y;
             for (int64_t x = 0; x < haloed.x; ++x) {
-              const int64_t off = plane + z * pitch + y * haloed.x + x;
+              const int64_t off = plane + lead_pad + z * pitch + y * y_stride + x;
               h[off] = static_cast<T>(fn(::carbon::int64_3d(x_origin + x, global_y, global_z), c));
             }
           }

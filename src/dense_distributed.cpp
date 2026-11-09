@@ -86,7 +86,8 @@ DenseDistributed::init_common_(System system,
                                float32_3d origin,
                                float spacing,
                                ProcessGrid process_grid,
-                               std::optional<LaunchShape> block_override) {
+                               std::optional<LaunchShape> block_override,
+                               LayoutOptions layout) {
   if (!std::isfinite(spacing) || spacing <= 0.0F) {
     log::throw_with_log<std::invalid_argument>(
         "DenseDistributed: spacing must be finite and strictly positive (spacing={})", spacing);
@@ -192,11 +193,12 @@ DenseDistributed::init_common_(System system,
     const int32_3d gpu_coords =
         distributed ? coords : process_grid_.coords_of(static_cast<int32_t>(i));
     const detail::dense_distributed::RankChunk chunk =
-        detail::dense_distributed::rank_chunk(global_, process_grid_, gpu_coords, halo);
+        detail::dense_distributed::rank_chunk(global_, process_grid_, gpu_coords, halo, layout);
 
     return detail::dense_distributed::Span(chunk.haloed, global_, chunk.xy_pitch, chunk.offset,
                                            chunk.halo, boundary_mode_, legacy_slab, origin_,
-                                           spacing_);
+                                           spacing_, chunk.y_stride, chunk.component_stride,
+                                           chunk.lead_pad);
   });
 
   for (auto view : data_view_options()) {
@@ -223,13 +225,14 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   LayoutOptions layout)
     : DenseDistributed() {
   const int world_size = resolve_world_size(system);
   const ProcessGrid pg =
       world_size > 0 ? ProcessGrid::make(world_size, DecompositionMode::Slab) : ProcessGrid{};
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               pg, block_override);
+               pg, block_override, layout);
 }
 
 DenseDistributed::DenseDistributed(System system,
@@ -239,7 +242,8 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   LayoutOptions layout)
     : DenseDistributed() {
   const int world_size = resolve_world_size(system);
   const ProcessGrid pg =
@@ -257,7 +261,7 @@ DenseDistributed::DenseDistributed(System system,
     }
   }
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               pg, block_override);
+               pg, block_override, layout);
 }
 
 DenseDistributed::DenseDistributed(System system,
@@ -267,10 +271,11 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   LayoutOptions layout)
     : DenseDistributed() {
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               std::move(process_grid), block_override);
+               std::move(process_grid), block_override, layout);
 }
 
 auto

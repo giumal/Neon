@@ -40,7 +40,8 @@ using ValidatedIdx = ::carbon::detail::Validated<Idx>;
  *   cells follow, and the upper halo the remaining @c halo() layers.
  * - @c xy_slab_elements() is the number of T-sized elements between two adjacent z planes in
  *   the haloed buffer. It is at least @c haloed_extent().x * haloed_extent().y ; halos are
- *   included in the extent rather than encoded as pitch padding.
+ *   included in the extent. When @ref LayoutOptions::pad_rows is enabled it is
+ *   @c y_stride() * haloed_extent().y , with each row rounded up to the requested alignment.
  * - @c global_extent() is the full Cartesian grid extent shared by every chunk. It is needed to
  *   distinguish, in @c Partition::neighbour, an in-buffer halo cell that maps to a real global
  *   cell (interior chunk boundary) from one that lies outside the global domain (an open face).
@@ -52,6 +53,9 @@ class Span {
   int64_3d haloed_extent_{};
   int64_3d global_extent_{};
   int64_t xy_slab_elements_{};
+  int64_t y_stride_{};
+  int64_t component_stride_{};
+  int64_t lead_pad_{};
   int64_3d offset_{};
   int64_3d halo_{};
   BoundaryModeDistributed boundary_mode_{BoundaryModeDistributed::Open};
@@ -70,10 +74,18 @@ public:
                            BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                            bool legacy_slab = false,
                            float32_3d origin = {},
-                           float spacing = 1.0F) noexcept
+                           float spacing = 1.0F,
+                           int64_t y_stride = 0,
+                           int64_t component_stride = 0,
+                           int64_t lead_pad = 0) noexcept
       : haloed_extent_(haloed_extent),
         global_extent_(global_extent),
         xy_slab_elements_(xy_slab_elements),
+        y_stride_(y_stride > 0 ? y_stride : haloed_extent.x),
+        component_stride_(component_stride > 0
+                              ? component_stride
+                              : lead_pad + haloed_extent.z * xy_slab_elements),
+        lead_pad_(lead_pad),
         offset_(offset),
         halo_(halo),
         boundary_mode_(boundary_mode),
@@ -103,6 +115,13 @@ public:
    * @param origin            Physical-space origin of global cell @c (0,0,0)'s corner (same
    *                          convention as @c global_location on integer indices).
    * @param spacing           Isotropic cell spacing along every axis (must be finite and > 0).
+   * @param y_stride          Elements between adjacent y rows. Default 0 keeps the historical
+   *                          @c haloed_extent.x stride. DenseDistributed passes the padded value
+   *                          when @ref LayoutOptions::pad_rows is enabled.
+   * @param component_stride  Elements per component plane, including any lead pad and tail
+   *                          padding. Default 0 derives the historical
+   *                          @c haloed_extent.z * xy_slab_elements pitch.
+   * @param lead_pad          Elements before buffer @c x == 0 in each component plane. Default 0.
    */
   /** Z-only convenience overload: equivalent to full @c offset={0,0,z_offset} and
    *  @c halo={0,0,halo_z}. @p legacy_slab defaults to false; pass true for a legacy z-slab. */
@@ -114,7 +133,10 @@ public:
                            BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                            bool legacy_slab = false,
                            float32_3d origin = {},
-                           float spacing = 1.0F) noexcept
+                           float spacing = 1.0F,
+                           int64_t y_stride = 0,
+                           int64_t component_stride = 0,
+                           int64_t lead_pad = 0) noexcept
       : Span(haloed_extent,
              global_extent,
              xy_slab_elements,
@@ -127,7 +149,10 @@ public:
              boundary_mode,
              legacy_slab,
              origin,
-             spacing) {}
+             spacing,
+             y_stride,
+             component_stride,
+             lead_pad) {}
 
   /** Storage extent (includes halo layers on every axis where @ref halo() is non-zero). */
   [[nodiscard]] CARBON_HD constexpr auto
@@ -209,10 +234,25 @@ public:
     return owned;
   }
 
-  /** Elements per XY plane (pitch in elements), same for halo and owned layers. */
+  /**
+   * Elements per XY plane (pitch in elements), same for halo and owned layers. With row padding
+   * enabled this is @c y_stride * haloed_extent().y rather than the minimum @c x * y.
+   */
   [[nodiscard]] CARBON_HD constexpr auto
   xy_slab_elements() const noexcept -> int64_t {
     return xy_slab_elements_;
+  }
+
+  /** Elements between adjacent y rows (at least @c haloed_extent().x). */
+  [[nodiscard]] CARBON_HD constexpr auto
+  y_stride() const noexcept -> int64_t {
+    return y_stride_;
+  }
+
+  /** Elements before buffer @c x == 0 in each component plane (zero when unpadded). */
+  [[nodiscard]] CARBON_HD constexpr auto
+  lead_pad() const noexcept -> int64_t {
+    return lead_pad_;
   }
 
   [[nodiscard]] CARBON_HD constexpr auto
@@ -274,13 +314,13 @@ public:
   }
 
   /**
-   * Contiguous element count for this slab's storage: @c haloed_extent().z layers times
-   * @c xy_slab_elements() per layer. Matches the buffer sizing used by
-   * @c DenseDistributed::newField (lower halo + owned + upper halo).
+   * Contiguous element count for one component plane: the component stride, including any lead
+   * pad and tail padding. Matches the buffer sizing used by @c DenseDistributed::newField
+   * (lower halo + owned + upper halo, plus optional storage padding).
    */
   [[nodiscard]] CARBON_HD constexpr auto
   linear_storage_elements() const noexcept -> int64_t {
-    return haloed_extent_.z * xy_slab_elements_;
+    return component_stride_;
   }
 
   /**
@@ -331,7 +371,8 @@ public:
   /**
    * Element offset (in units of @c T) from the start of a partition buffer to the cell at @p idx
    * for component @p component_id, using this span's SoA dense layout:
-   * @c component_id * linear_storage_elements() + iz * xy_slab_elements() + iy * haloed_extent().x + ix.
+   * @c component_id * linear_storage_elements() + lead_pad() + iz * xy_slab_elements() +
+   * iy * y_stride() + ix.
    *
    * Matches Neon's @c dPartition::getPitch with its default pitch. No bounds checking.
    */
@@ -476,8 +517,8 @@ Span::global_location(const Idx& idx) const noexcept -> int64_3d {
 Span::linear_offset(const Idx& idx,
                     int component_id) const noexcept -> int64_t {
   const int64_3d cell = idx.cell();
-  return static_cast<int64_t>(component_id) * linear_storage_elements() +
-         cell.z * xy_slab_elements_ + cell.y * haloed_extent_.x + cell.x;
+  return static_cast<int64_t>(component_id) * component_stride_ + lead_pad_ +
+         cell.z * xy_slab_elements_ + cell.y * y_stride_ + cell.x;
 }
 
 [[nodiscard]] CARBON_HD constexpr auto

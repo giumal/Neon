@@ -6245,3 +6245,13 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   factorisation that minimises the per-rank halo surface for the requested mode, preferring
   pencil-like two-axis splits on ties; `DenseDistributed` uses it for `Pencil`/`Brick` and logs
   the chosen dims on rank 0. Non-legacy slabs now use `stencil.radius3().z` for the z halo.
+- **2026-11 — Opt-in padded `DenseDistributed` storage layout (§3.1a).** `LayoutOptions`
+  (`pad_rows`, `row_alignment`, `component_alignment`) is threaded through the
+  `DenseDistributed` constructors into `rank_chunk`/`Span`. With `pad_rows` enabled, rows are
+  rounded up to 32 elements (128 B for fp32), each component plane gets a lead pad so buffer
+  `x == halo.x` is row-aligned, and the component stride is rounded up to 64 elements (256 B for
+  fp32). The default remains the exact historical compact layout. `Span` now exposes
+  `y_stride()` / `lead_pad()` and uses them in `linear_offset`; `Partition::cursor`, the host
+  fill helpers, the multi-axis run-based halo geometry, the packed pack/unpack plan, and the VTK
+  shard writer all follow the padded strides. The host test adds a padded-layout case plus
+  padded X/Y/Z packed and run-based exchange scenarios.

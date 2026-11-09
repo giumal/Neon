@@ -93,7 +93,7 @@ struct PackBox {
  * Everything a pack/unpack kernel needs, as a POD passed by value.
  *
  * Field addressing (matches DenseDistributed): element (c, x, y, z) lives at
- *   c * comp_stride + z * pitch + y * haloed_x + x.
+ *   c * comp_stride + lead_pad + z * pitch + y * y_stride + x.
  * Staging addressing: plane k (= the k-th packed component) is contiguous and x-fastest:
  *   k * stage_comp_stride + (iz * ext_y + iy) * ext_x + ix,   stage_comp_stride = ext_x*ext_y*ext_z.
  */
@@ -101,7 +101,8 @@ struct PackKernelArgs {
   int64_t lo_x{};
   int64_t lo_y{};
   int64_t lo_z{};
-  int64_t haloed_x{};
+  int64_t y_stride{};
+  int64_t lead_pad{};
   int64_t pitch{};
   int64_t comp_stride{};
   int64_t stage_comp_stride{};
@@ -152,8 +153,8 @@ pack_gather_thread(const W* CARBON_PACK_RESTRICT field,
   }
   const uint32_t iy = j / a.ext_x;
   const uint32_t ix = j - iy * a.ext_x;
-  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride +
-                        (a.lo_y + static_cast<int64_t>(iy)) * a.haloed_x + a.lo_x +
+  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride + a.lead_pad +
+                        (a.lo_y + static_cast<int64_t>(iy)) * a.y_stride + a.lo_x +
                         static_cast<int64_t>(ix);
   const int64_t sbase = static_cast<int64_t>(bz) * a.stage_comp_stride + static_cast<int64_t>(j);
   for (uint32_t iz = by; iz < a.ext_z; iz += gdy) {
@@ -180,8 +181,8 @@ pack_scatter_thread(const W* CARBON_PACK_RESTRICT stage,
   }
   const uint32_t iy = j / a.ext_x;
   const uint32_t ix = j - iy * a.ext_x;
-  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride +
-                        (a.lo_y + static_cast<int64_t>(iy)) * a.haloed_x + a.lo_x +
+  const int64_t fbase = static_cast<int64_t>(a.comps[bz]) * a.comp_stride + a.lead_pad +
+                        (a.lo_y + static_cast<int64_t>(iy)) * a.y_stride + a.lo_x +
                         static_cast<int64_t>(ix);
   const int64_t sbase = static_cast<int64_t>(bz) * a.stage_comp_stride + static_cast<int64_t>(j);
   for (uint32_t iz = by; iz < a.ext_z; iz += gdy) {
@@ -370,7 +371,8 @@ append_steps(std::vector<PackStep>& out,
     a.lo_x = box.lo_x;
     a.lo_y = box.lo_y;
     a.lo_z = box.lo_z;
-    a.haloed_x = g.haloed.x;
+    a.y_stride = g.y_stride > 0 ? g.y_stride : g.haloed.x;
+    a.lead_pad = g.lead_pad;
     a.pitch = g.pitch;
     a.comp_stride = comp_stride;
     a.stage_comp_stride = per_comp;
