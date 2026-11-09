@@ -76,6 +76,28 @@ launch_scatter(const Gpu& gpu,
                void* field_base,
                const PackKernelArgs& a) -> gpu_error_t;
 
+/**
+ * Batched @ref launch_gather: every step in @p b is issued by one kernel launch. The batch
+ * argument block is fixed-size and copied by value; callers must fall back to per-step launches
+ * when @c b.step_count is zero.
+ */
+[[nodiscard]] CARBON_API auto
+launch_gather_batch(const Gpu& gpu,
+                    gpu_stream_t stream,
+                    std::size_t elem_bytes,
+                    const void* field_base,
+                    void* stage_base,
+                    const PackBatchArgs& b) -> gpu_error_t;
+
+/** Batched @ref launch_scatter. */
+[[nodiscard]] CARBON_API auto
+launch_scatter_batch(const Gpu& gpu,
+                     gpu_stream_t stream,
+                     std::size_t elem_bytes,
+                     const void* stage_base,
+                     void* field_base,
+                     const PackBatchArgs& b) -> gpu_error_t;
+
 }  // namespace carbon::detail::halo_pack
 
 #endif  // CARBON_BACKEND_IS_CUDALIKE

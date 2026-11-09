@@ -6255,3 +6255,13 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   fill helpers, the multi-axis run-based halo geometry, the packed pack/unpack plan, and the VTK
   shard writer all follow the padded strides. The host test adds a padded-layout case plus
   padded X/Y/Z packed and run-based exchange scenarios.
+- **2026-11 — Batched pack/unpack and face-only halo fusion (§3.3 + §3.2).** Packed gather/scatter
+  steps now fold into one kernel launch (`PackBatchArgs`, `grid.z` = component planes, step
+  selected through a prefix table) instead of one launch per <=32-component chunk. Batches are
+  capped at eight steps so the by-value argument block stays under the portable 4 KiB
+  kernel-parameter limit; a larger pass falls back to per-step launches. Face-only lattice
+  stencils (no offset with two nonzero axes) also fold every packed axis into one gather, one
+  NCCL group and one scatter, removing the X -> Y -> Z pass dependency. Diagonal stencils
+  (D3Q19/D3Q27) and `Standard` semantics (which copy full boundary planes, corners included)
+  keep the staged passes. The host test now drives the batched gather/scatter, checks the
+  over-limit fallback, and compares a fused D3Q7 exchange against the staged oracle.

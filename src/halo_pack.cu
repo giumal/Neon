@@ -38,6 +38,24 @@ scatter_kernel(const W* __restrict__ stage,
 }
 
 template <typename W>
+__global__ void
+gather_batch_kernel(const W* __restrict__ field,
+                    W* __restrict__ stage,
+                    PackBatchArgs b) {
+  pack_gather_batch_thread<W>(field, stage, b, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+                              blockDim.x, gridDim.y);
+}
+
+template <typename W>
+__global__ void
+scatter_batch_kernel(const W* __restrict__ stage,
+                     W* __restrict__ field,
+                     PackBatchArgs b) {
+  pack_scatter_batch_thread<W>(stage, field, b, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+                               blockDim.x, gridDim.y);
+}
+
+template <typename W>
 auto
 gather_as(const Gpu& gpu,
           gpu_stream_t stream,
@@ -61,6 +79,32 @@ scatter_as(const Gpu& gpu,
   return gpu.template typed_launch<&scatter_kernel<W>>(
       dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
       static_cast<const W*>(stage), static_cast<W*>(field), a);
+}
+
+template <typename W>
+auto
+gather_batch_as(const Gpu& gpu,
+                gpu_stream_t stream,
+                const void* field,
+                void* stage,
+                const PackBatchArgs& b) -> gpu_error_t {
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  return gpu.template typed_launch<&gather_batch_kernel<W>>(
+      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
+      static_cast<const W*>(field), static_cast<W*>(stage), b);
+}
+
+template <typename W>
+auto
+scatter_batch_as(const Gpu& gpu,
+                 gpu_stream_t stream,
+                 const void* stage,
+                 void* field,
+                 const PackBatchArgs& b) -> gpu_error_t {
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  return gpu.template typed_launch<&scatter_batch_kernel<W>>(
+      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
+      static_cast<const W*>(stage), static_cast<W*>(field), b);
 }
 
 }  // namespace
@@ -106,6 +150,58 @@ launch_scatter(const Gpu& gpu,
       return scatter_as<std::uint64_t>(gpu, stream, stage_region, field_base, a);
     case 16U:
       return scatter_as<Word16>(gpu, stream, stage_region, field_base, a);
+    default:
+      return gpu_error_invalid_value;
+  }
+}
+
+auto
+launch_gather_batch(const Gpu& gpu,
+                    gpu_stream_t stream,
+                    std::size_t elem_bytes,
+                    const void* field_base,
+                    void* stage_base,
+                    const PackBatchArgs& b) -> gpu_error_t {
+  if (b.step_count == 0U) {
+    return gpu_success;
+  }
+  switch (elem_bytes) {
+    case 1U:
+      return gather_batch_as<std::uint8_t>(gpu, stream, field_base, stage_base, b);
+    case 2U:
+      return gather_batch_as<std::uint16_t>(gpu, stream, field_base, stage_base, b);
+    case 4U:
+      return gather_batch_as<std::uint32_t>(gpu, stream, field_base, stage_base, b);
+    case 8U:
+      return gather_batch_as<std::uint64_t>(gpu, stream, field_base, stage_base, b);
+    case 16U:
+      return gather_batch_as<Word16>(gpu, stream, field_base, stage_base, b);
+    default:
+      return gpu_error_invalid_value;
+  }
+}
+
+auto
+launch_scatter_batch(const Gpu& gpu,
+                     gpu_stream_t stream,
+                     std::size_t elem_bytes,
+                     const void* stage_base,
+                     void* field_base,
+                     const PackBatchArgs& b) -> gpu_error_t {
+  if (b.step_count == 0U) {
+    return gpu_success;
+  }
+  switch (elem_bytes) {
+    case 1U:
+      return scatter_batch_as<std::uint8_t>(gpu, stream, stage_base, field_base, b);
+    case 2U:
+      return scatter_batch_as<std::uint16_t>(gpu, stream, stage_base, field_base, b);
+    case 4U:
+      return scatter_batch_as<std::uint32_t>(gpu, stream, stage_base, field_base, b);
+    case 8U:
+      return scatter_batch_as<std::uint64_t>(gpu, stream, stage_base, field_base, b);
+    case 16U:
+      return scatter_batch_as<Word16>(gpu, stream, stage_base, field_base, b);
     default:
       return gpu_error_invalid_value;
   }

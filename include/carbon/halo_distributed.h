@@ -214,6 +214,11 @@ public:
   dist_entry_count() const noexcept -> size_t {
 #ifdef CARBON_HAVE_MPI_NCCL
     if (!axis_passes_.empty()) {
+#if CARBON_BACKEND_IS_CUDALIKE
+      if (fused_pack_) {
+        return fused_dist_staged_.entry_count();
+      }
+#endif
       size_t n = 0;
       for (const AxisPass& pass : axis_passes_) {
         n += pass.dist.entry_count();
@@ -253,6 +258,22 @@ public:
       stream.wait_for_all(fence_event_);
     }
     if (!axis_passes_.empty()) {
+#if CARBON_BACKEND_IS_CUDALIKE
+      // Face-only lattice stencils do not need the staged X -> Y -> Z dependency: every
+      // needed halo cell comes from an owned face, so all axes can share one gather, one NCCL
+      // group and one scatter. Diagonal stencils (D3Q19/D3Q27) and Standard semantics keep
+      // the staged passes below.
+      if (fused_pack_) {
+        run_pack_batch_(fused_gathers_, stream, /*gather=*/true);
+#ifdef CARBON_HAVE_MPI_NCCL
+        if (fused_dist_staged_.entry_count() > 0U) {
+          fused_dist_staged_(stream);
+        }
+#endif
+        run_pack_batch_(fused_scatters_, stream, /*gather=*/false);
+        return;
+      }
+#endif
       for (size_t i = 0; i < axis_passes_.size(); ++i) {
         const AxisPass& pass = axis_passes_[i];
 
@@ -260,7 +281,7 @@ public:
         // `stream`, so ordinary stream order (not a host barrier) sequences gather < comm < scatter
         // and this pass < the next pass. Empty for Z passes and for run-based fallbacks.
 #if CARBON_BACKEND_IS_CUDALIKE
-        run_pack_steps_(pass.gathers, stream, /*gather=*/true);
+        run_pack_(pass.gathers, pass.gather_batch, stream, /*gather=*/true);
 #endif
         pass.intra(stream);
 #ifdef CARBON_HAVE_MPI_NCCL
@@ -270,7 +291,7 @@ public:
 #endif
 #endif
 #if CARBON_BACKEND_IS_CUDALIKE
-        run_pack_steps_(pass.scatters, stream, /*gather=*/false);
+        run_pack_(pass.scatters, pass.scatter_batch, stream, /*gather=*/false);
 #endif
 
         if (i + 1U < axis_passes_.size()) {
@@ -435,8 +456,11 @@ private:
     mutable Event fence_event{};
 #if CARBON_BACKEND_IS_CUDALIKE
     // Packed X/Y exchange (see detail/halo_pack_plan.h). Empty unless this pass was packed.
+    bool packed{false};
     std::vector<detail::halo_pack::PackStep> gathers{};
     std::vector<detail::halo_pack::PackStep> scatters{};
+    detail::halo_pack::PackBatchArgs gather_batch{};
+    detail::halo_pack::PackBatchArgs scatter_batch{};
     std::vector<detail::halo_pack::PackMsg> staged_msgs{};
 #ifdef CARBON_HAVE_MPI_NCCL
     DistTransfer<T> dist_staged{};  ///< bound to HaloDistributed::stage_, not to the field buffer
@@ -474,6 +498,43 @@ private:
       }
     }
   }
+
+  /** Launch a folded batch; @p b must have been produced by make_pack_batch. */
+  auto
+  run_pack_batch_(const detail::halo_pack::PackBatchArgs& b,
+                  const Stream& stream,
+                  bool gather) const -> void {
+    if (b.step_count == 0U) {
+      return;
+    }
+    const detail::Gpu& gpu = field_.dense().system().gpu_group().devices()[0];
+    const detail::gpu_stream_t native = stream.native_at(0);
+    T* field_base = field_.gpu_buffers()[0].data();
+    T* stage_base = stage_[0].data();
+    const detail::gpu_error_t err =
+        gather ? detail::halo_pack::launch_gather_batch(gpu, native, sizeof(T), field_base,
+                                                        stage_base, b)
+               : detail::halo_pack::launch_scatter_batch(gpu, native, sizeof(T), stage_base,
+                                                         field_base, b);
+    if (err != detail::gpu_success) {
+      log::throw_with_log<std::runtime_error>(
+          "HaloDistributed batched packed {} kernel launch failed: {}",
+          gather ? "gather" : "scatter", detail::gpu_error_string(err));
+    }
+  }
+
+  /** Prefer the folded launch, falling back to one launch per step when it does not fit. */
+  auto
+  run_pack_(const std::vector<detail::halo_pack::PackStep>& steps,
+            const detail::halo_pack::PackBatchArgs& b,
+            const Stream& stream,
+            bool gather) const -> void {
+    if (b.step_count > 0U) {
+      run_pack_batch_(b, stream, gather);
+    } else {
+      run_pack_steps_(steps, stream, gather);
+    }
+  }
 #endif
 
   DenseDistributed::Field<T, Components> field_{};
@@ -493,6 +554,14 @@ private:
   // One contiguous staging buffer shared by every packed pass (single local GPU only). Allocated
   // in the constructor so no allocation can land inside graph capture or a timed region.
   Buffer<T> stage_{};
+  // Face-only stencils fold every packed axis into one gather/NCCL/scatter group.
+  bool fused_pack_{false};
+  detail::halo_pack::PackBatchArgs fused_gathers_{};
+  detail::halo_pack::PackBatchArgs fused_scatters_{};
+  std::vector<detail::halo_pack::PackMsg> fused_staged_msgs_{};
+#ifdef CARBON_HAVE_MPI_NCCL
+  DistTransfer<T> fused_dist_staged_{};
+#endif
 #endif
   // See operator(): host barrier between axis passes. CARBON_HALO_PASS_BARRIER=1 enables it.
   bool pass_barrier_{false};
@@ -1091,8 +1160,11 @@ HaloDistributed<T,
 
 #if CARBON_BACKEND_IS_CUDALIKE
     if (pack_axis) {
+      pass.packed = true;
       pass.gathers = std::move(pack_plan.gathers);
       pass.scatters = std::move(pack_plan.scatters);
+      pass.gather_batch = detail::halo_pack::make_pack_batch(pass.gathers);
+      pass.scatter_batch = detail::halo_pack::make_pack_batch(pass.scatters);
       pass.staged_msgs = std::move(pack_plan.msgs);
     }
 #endif
@@ -1127,6 +1199,57 @@ HaloDistributed<T,
       pass.dist_staged = staged.finalise(dense.system(), stage_);
     }
 #endif
+
+    // A face-only stencil has no cell that depends on two axes at once, so the staged
+    // X -> Y -> Z dependency disappears. Fold every packed axis into one gather, one NCCL
+    // group and one scatter. Diagonal stencils keep the per-axis passes.
+    const bool face_only_stencil = std::all_of(
+        stencil_.points().begin(), stencil_.points().end(), [](const int8_3d& p) {
+          const int axes = static_cast<int>(p.x != 0) + static_cast<int>(p.y != 0) +
+                           static_cast<int>(p.z != 0);
+          return axes <= 1;
+        });
+    bool all_packed = axis_passes_.size() > 1U;
+    size_t gather_steps = 0U;
+    size_t scatter_steps = 0U;
+    for (const AxisPass& pass : axis_passes_) {
+      all_packed = all_packed && pass.packed;
+      gather_steps += pass.gathers.size();
+      scatter_steps += pass.scatters.size();
+    }
+    // Standard semantics copies the full boundary plane, corners included, so it keeps the
+    // staged passes even when the stencil itself has no diagonal offsets.
+    if (pack_ok && semantic_ != StencilSemantic::Standard && face_only_stencil && all_packed &&
+        gather_steps <= detail::halo_pack::kMaxPackBatchSteps &&
+        scatter_steps <= detail::halo_pack::kMaxPackBatchSteps) {
+      std::vector<detail::halo_pack::PackStep> gathers;
+      std::vector<detail::halo_pack::PackStep> scatters;
+      for (const AxisPass& pass : axis_passes_) {
+        gathers.insert(gathers.end(), pass.gathers.begin(), pass.gathers.end());
+        scatters.insert(scatters.end(), pass.scatters.begin(), pass.scatters.end());
+        fused_staged_msgs_.insert(fused_staged_msgs_.end(), pass.staged_msgs.begin(),
+                                  pass.staged_msgs.end());
+      }
+      fused_gathers_ = detail::halo_pack::make_pack_batch(gathers);
+      fused_scatters_ = detail::halo_pack::make_pack_batch(scatters);
+      if (fused_gathers_.step_count > 0U && fused_scatters_.step_count > 0U) {
+        fused_pack_ = true;
+#ifdef CARBON_HAVE_MPI_NCCL
+        if (!fused_staged_msgs_.empty()) {
+          detail::halo_pack::sort_msgs(fused_staged_msgs_);
+          detail::halo_build::DistTransferBuilder<T> staged;
+          for (const detail::halo_pack::PackMsg& m : fused_staged_msgs_) {
+            staged.push(m.peer, m.op == detail::halo_pack::MsgOp::Send ? DistOp::Send
+                                                                        : DistOp::Recv,
+                        m.first, m.count);
+          }
+          fused_dist_staged_ = staged.finalise(dense.system(), stage_);
+        }
+#endif
+      } else {
+        fused_staged_msgs_.clear();
+      }
+    }
   }
 #endif
 }

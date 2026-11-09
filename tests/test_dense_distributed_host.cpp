@@ -83,7 +83,7 @@ lattice(int q) -> std::vector<Vel> {
     for (int y = -1; y <= 1; ++y) {
       for (int x = -1; x <= 1; ++x) {
         const int nz = (x != 0) + (y != 0) + (z != 0);
-        if (q == 27 || (q == 19 && nz <= 2)) {
+        if (q == 27 || (q == 19 && nz <= 2) || (q == 7 && nz <= 1)) {
           v.push_back({x, y, z});
         }
       }
@@ -321,6 +321,12 @@ exchange_packed(World& w,
 
   // 1) gather everywhere (before any message is delivered or scattered).
   for (size_t i = 0; i < w.ranks.size(); ++i) {
+    const hp::PackBatchArgs gb = hp::make_pack_batch(plans[i].gathers);
+    if (gb.step_count > 0U) {
+      hp::host_gather_batch<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data(), gb);
+      ++stats.kernels;
+      continue;
+    }
     for (const hp::PackStep& s : plans[i].gathers) {
       hp::host_gather<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data() + s.stage_offset,
                                 s.args);
@@ -360,11 +366,105 @@ exchange_packed(World& w,
 
   // 3) scatter everywhere.
   for (size_t i = 0; i < w.ranks.size(); ++i) {
+    const hp::PackBatchArgs sb = hp::make_pack_batch(plans[i].scatters);
+    if (sb.step_count > 0U) {
+      hp::host_scatter_batch<uint64_t>(w.ranks[i].stage.data(), w.ranks[i].buf.data(), sb);
+      ++stats.kernels;
+      continue;
+    }
     for (const hp::PackStep& s : plans[i].scatters) {
       hp::host_scatter<uint64_t>(w.ranks[i].stage.data() + s.stage_offset, w.ranks[i].buf.data(),
                                  s.args);
       ++stats.kernels;
     }
+  }
+  return stats;
+}
+
+// Face-only fusion: every axis shares one gather, one message group and one scatter. This is the
+// host mirror of HaloDistributed's fused_pack_ path (no X -> Y -> Z dependency).
+auto
+exchange_packed_fused(World& w,
+                      std::vector<size_t>& stage_cursor) -> PassStats {
+  PassStats stats;
+  constexpr std::array<Axis, 3> axes{Axis::X, Axis::Y, Axis::Z};
+  std::array<std::vector<hp::AxisPackPlan>, axes.size()> plans;
+  for (auto& per_rank : plans) {
+    per_rank.resize(w.ranks.size());
+  }
+
+  for (size_t i = 0; i < w.ranks.size(); ++i) {
+    Rank& rk = w.ranks[i];
+    for (size_t a = 0; a < axes.size(); ++a) {
+      plans[a][i] = hp::build_axis_pack_plan(
+          w.pg, w.bm, rk.coords, static_cast<int32_t>(i), rk.g, axes[a], w.comps,
+          rk.comp_stride,
+          [&](int c, Axis ax, AxisSide sd) {
+            return w.active_send(c, ax, sd);
+          },
+          [&](int c, Axis ax, AxisSide sd) {
+            return w.active_recv(c, ax, sd);
+          },
+          stage_cursor[i]);
+      hp::sort_msgs(plans[a][i].msgs);
+      stage_cursor[i] += plans[a][i].stage_elems;
+      rk.stage.resize(std::max(rk.stage.size(), stage_cursor[i]), kSentinel);
+    }
+  }
+
+  for (size_t i = 0; i < w.ranks.size(); ++i) {
+    std::vector<hp::PackStep> steps;
+    for (const auto& per_rank : plans) {
+      steps.insert(steps.end(), per_rank[i].gathers.begin(), per_rank[i].gathers.end());
+    }
+    const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
+    CHECK(batch.step_count == steps.size());
+    hp::host_gather_batch<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data(), batch);
+    ++stats.kernels;
+  }
+
+  // Per-axis plans are already key-sorted. Iterating axes in X/Y/Z order makes the combined
+  // per-peer order identical on both ends (the key starts with the axis id), matching sort_msgs.
+  std::map<std::pair<int, int>, std::vector<const hp::PackMsg*>> sends;
+  std::map<std::pair<int, int>, std::vector<const hp::PackMsg*>> recvs;
+  for (size_t i = 0; i < w.ranks.size(); ++i) {
+    for (const auto& per_rank : plans) {
+      for (const hp::PackMsg& m : per_rank[i].msgs) {
+        ++stats.msgs;
+        if (m.op == hp::MsgOp::Send) {
+          sends[{static_cast<int>(i), m.peer}].push_back(&m);
+        } else {
+          recvs[{m.peer, static_cast<int>(i)}].push_back(&m);
+        }
+      }
+    }
+  }
+  CHECK(sends.size() == recvs.size());
+  for (const auto& [pair, slist] : sends) {
+    const auto it = recvs.find(pair);
+    CHECK(it != recvs.end());
+    const auto& rlist = it->second;
+    CHECK(slist.size() == rlist.size());
+    for (size_t k = 0; k < slist.size(); ++k) {
+      CHECK(slist[k]->count == rlist[k]->count);
+      CHECK(slist[k]->key == rlist[k]->key);
+      const Rank& s = w.ranks[static_cast<size_t>(pair.first)];
+      Rank& d = w.ranks[static_cast<size_t>(pair.second)];
+      std::copy_n(s.stage.begin() + static_cast<std::ptrdiff_t>(slist[k]->first),
+                  static_cast<std::ptrdiff_t>(slist[k]->count),
+                  d.stage.begin() + static_cast<std::ptrdiff_t>(rlist[k]->first));
+    }
+  }
+
+  for (size_t i = 0; i < w.ranks.size(); ++i) {
+    std::vector<hp::PackStep> steps;
+    for (const auto& per_rank : plans) {
+      steps.insert(steps.end(), per_rank[i].scatters.begin(), per_rank[i].scatters.end());
+    }
+    const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
+    CHECK(batch.step_count == steps.size());
+    hp::host_scatter_batch<uint64_t>(w.ranks[i].stage.data(), w.ranks[i].buf.data(), batch);
+    ++stats.kernels;
   }
   return stats;
 }
@@ -576,9 +676,14 @@ part_a_roundtrip() -> void {
       CHECK(steps.size() == (cl.size() + hp::kMaxPackComps - 1) / hp::kMaxPackComps);
       CHECK(steps.size() >= 2U);
       std::vector<W> stage(cl.size() * box.volume(), make_elem<W>(0));
-      for (const auto& s : steps) {
-        hp::host_gather<W>(field.data(), stage.data() + s.stage_offset, s.args);
+      const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
+      CHECK(batch.step_count == steps.size());
+      std::vector<hp::PackStep> too_many = steps;
+      while (too_many.size() <= hp::kMaxPackBatchSteps) {
+        too_many.push_back(steps.front());
       }
+      CHECK(hp::make_pack_batch(too_many).step_count == 0U);  // caller must fall back
+      hp::host_gather_batch<W>(field.data(), stage.data(), batch);
       // Against an explicit triple loop.
       size_t n = 0;
       for (const int c : cl) {
@@ -597,9 +702,7 @@ part_a_roundtrip() -> void {
       CHECK(n == stage.size());
       // Scatter into a clean field: writes exactly the box cells of exactly the listed comps.
       std::vector<W> out(field.size(), make_elem<W>(0));
-      for (const auto& s : steps) {
-        hp::host_scatter<W>(stage.data() + s.stage_offset, out.data(), s.args);
-      }
+      hp::host_scatter_batch<W>(stage.data(), out.data(), batch);
       size_t written = 0;
       for (size_t i = 0; i < out.size(); ++i) {
         if (!(out[i] == make_elem<W>(0))) {
@@ -646,6 +749,12 @@ part_a_launch_shapes() -> void {
       hp::detail_plan::append_steps(steps, box, cl, g, cs, 0);
       CHECK(steps.size() == 1U);
       const hp::PackLaunchShape ls = hp::pack_launch_shape(steps[0].args);
+      const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
+      const hp::PackLaunchShape bs = hp::pack_batch_launch_shape(batch);
+      CHECK(batch.step_count == 1U);
+      CHECK(bs.grid_x == ls.grid_x);
+      CHECK(bs.grid_y == ls.grid_y);
+      CHECK(bs.grid_z == static_cast<uint32_t>(cl.size()));
       if (axis == Axis::X && sh.oy == 300) {
         CHECK(ls.grid_x == 2U);  // 300 rows over 256-thread blocks
       }
@@ -653,7 +762,7 @@ part_a_launch_shapes() -> void {
         CHECK(ls.grid_y == 65535U);  // capped: the grid-stride loop must cover the rest
       }
       std::vector<uint32_t> stage(cl.size() * box.volume(), 0U);
-      hp::host_gather<uint32_t>(field.data(), stage.data(), steps[0].args);
+      hp::host_gather_batch<uint32_t>(field.data(), stage.data(), batch);
       size_t n = 0;
       for (const int c : cl) {
         for (int64_t z = 0; z < box.ext_z; ++z) {
@@ -1389,6 +1498,11 @@ run_scenario(const Scenario& s,
   // New path: packed X, Y; Z is packed iff it carries several components (Halo's rule), else it
   // stays on the run-based path (a single contiguous run per side).
   const bool pack_z = packed.comps > 1;
+  const bool lattice_face_only = s.lattice_q == 7;
+  const int active_axes = static_cast<int>(s.hx > 0) + static_cast<int>(s.hy > 0) +
+                          static_cast<int>(s.hz > 0);
+  const bool fuse_candidate = lattice_face_only && pack_z && active_axes > 1;
+  World fused = fuse_candidate ? packed : World{};
   std::vector<size_t> cursor(packed.ranks.size(), 0);
   for (const Axis a : {Axis::X, Axis::Y}) {
     const PassStats st = exchange_packed(packed, a, cursor);
@@ -1407,6 +1521,11 @@ run_scenario(const Scenario& s,
              false);  // oracle: right on needed cells (it clobbers exterior halos, by design)...
   total_checked +=
       verify(packed, &oracle, true, pack_z);  // ...and the packed result must match it bit for bit
+  if (fuse_candidate) {
+    std::vector<size_t> fused_cursor(fused.ranks.size(), 0);
+    exchange_packed_fused(fused, fused_cursor);
+    total_checked += verify(fused, &oracle, true, pack_z);
+  }
   if (packed.semantic == Semantic::LatticeDistributed) {
     const size_t face_checked = verify_lattice_distributed_faces(oracle) +
                                 verify_lattice_distributed_faces(packed);
@@ -1464,6 +1583,7 @@ main() {
       sc.push_back({"d3q19", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0});
       sc.push_back({"d3q27", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5});
       sc.push_back({"d3q19-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, true});
+      sc.push_back({"d3q7-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 7, 0, true});
       sc.push_back({"d3q27-dist-pad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5, true});
       // Opt-in row/component padding: the packed and run-based paths must still agree.
       sc.push_back({"std-h111-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 3, 0, 0, false,

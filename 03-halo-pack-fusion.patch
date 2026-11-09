@@ -1,0 +1,785 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 5580ea9..2bbe37f 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -6255,3 +6255,13 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
+   fill helpers, the multi-axis run-based halo geometry, the packed pack/unpack plan, and the VTK
+   shard writer all follow the padded strides. The host test adds a padded-layout case plus
+   padded X/Y/Z packed and run-based exchange scenarios.
++- **2026-11 — Batched pack/unpack and face-only halo fusion (§3.3 + §3.2).** Packed gather/scatter
++  steps now fold into one kernel launch (`PackBatchArgs`, `grid.z` = component planes, step
++  selected through a prefix table) instead of one launch per <=32-component chunk. Batches are
++  capped at eight steps so the by-value argument block stays under the portable 4 KiB
++  kernel-parameter limit; a larger pass falls back to per-step launches. Face-only lattice
++  stencils (no offset with two nonzero axes) also fold every packed axis into one gather, one
++  NCCL group and one scatter, removing the X -> Y -> Z pass dependency. Diagonal stencils
++  (D3Q19/D3Q27) and `Standard` semantics (which copy full boundary planes, corners included)
++  keep the staged passes. The host test now drives the batched gather/scatter, checks the
++  over-limit fallback, and compares a fused D3Q7 exchange against the staged oracle.
+diff --git a/include/carbon/detail/halo_pack.h b/include/carbon/detail/halo_pack.h
+index a1c7fca..33ef883 100644
+--- a/include/carbon/detail/halo_pack.h
++++ b/include/carbon/detail/halo_pack.h
+@@ -76,6 +76,28 @@ launch_scatter(const Gpu& gpu,
+                void* field_base,
+                const PackKernelArgs& a) -> gpu_error_t;
+ 
++/**
++ * Batched @ref launch_gather: every step in @p b is issued by one kernel launch. The batch
++ * argument block is fixed-size and copied by value; callers must fall back to per-step launches
++ * when @c b.step_count is zero.
++ */
++[[nodiscard]] CARBON_API auto
++launch_gather_batch(const Gpu& gpu,
++                    gpu_stream_t stream,
++                    std::size_t elem_bytes,
++                    const void* field_base,
++                    void* stage_base,
++                    const PackBatchArgs& b) -> gpu_error_t;
++
++/** Batched @ref launch_scatter. */
++[[nodiscard]] CARBON_API auto
++launch_scatter_batch(const Gpu& gpu,
++                     gpu_stream_t stream,
++                     std::size_t elem_bytes,
++                     const void* stage_base,
++                     void* field_base,
++                     const PackBatchArgs& b) -> gpu_error_t;
++
+ }  // namespace carbon::detail::halo_pack
+ 
+ #endif  // CARBON_BACKEND_IS_CUDALIKE
+diff --git a/include/carbon/detail/halo_pack_plan.h b/include/carbon/detail/halo_pack_plan.h
+index 88a0079..3c029b1 100644
+--- a/include/carbon/detail/halo_pack_plan.h
++++ b/include/carbon/detail/halo_pack_plan.h
+@@ -71,6 +71,17 @@ using halo_distributed_build::AxisSide;
+ 
+ /** Maximum components packed by one kernel launch (kernel argument struct is fixed-size). */
+ inline constexpr uint32_t kMaxPackComps = 32U;
++/**
++ * Maximum pack steps folded into one batched kernel launch.
++ *
++ * The batch argument block is passed by value, so it must stay below the portable
++ * kernel-parameter limit (4 KiB on older CUDA/HIP toolchains). A pass with more steps
++ * falls back to one launch per step; the host planner reports that by leaving
++ * @c PackBatchArgs::step_count at zero.
++ */
++inline constexpr uint32_t kMaxPackBatchSteps = 8U;
++static_assert(kMaxPackBatchSteps * kMaxPackComps <= 65535U,
++              "batched pack grid.z must fit the portable CUDA/HIP grid limit");
+ /** Threads per block along x for pack/unpack kernels. */
+ inline constexpr uint32_t kPackBlockX = 256U;
+ 
+@@ -121,6 +132,25 @@ struct PackLaunchShape {
+   uint32_t block_x{};
+ };
+ 
++/**
++ * Several @ref PackKernelArgs folded into one kernel launch.
++ *
++ * @c grid.z is the total number of component planes across all steps; the kernel maps
++ * that flat index back to a step through @c prefix. @c stage_offsets are absolute element
++ * offsets into the shared staging buffer, so one launch can cover several sides/axes.
++ * @c step_count == 0 means "too large for one launch" and callers must fall back.
++ */
++struct PackBatchArgs {
++  uint32_t step_count{};
++  uint32_t total_comps{};
++  uint32_t prefix[kMaxPackBatchSteps + 1U]{};
++  PackKernelArgs steps[kMaxPackBatchSteps]{};
++  int64_t stage_offsets[kMaxPackBatchSteps]{};
++};
++
++static_assert(sizeof(PackBatchArgs) <= 4096U,
++              "PackBatchArgs must fit the portable CUDA/HIP kernel-parameter limit");
++
+ /** Launch geometry: x = flattened (x,y) row, y = grid-stride over z, z = packed component. */
+ [[nodiscard]] inline auto
+ pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
+@@ -132,6 +162,23 @@ pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
+   return s;
+ }
+ 
++/** Launch geometry for a folded batch: x/y cover the widest step, z covers every component. */
++[[nodiscard]] inline auto
++pack_batch_launch_shape(const PackBatchArgs& b) noexcept -> PackLaunchShape {
++  PackLaunchShape s;
++  s.block_x = kPackBlockX;
++  uint32_t max_row = 0U;
++  uint32_t max_ext_z = 0U;
++  for (uint32_t i = 0; i < b.step_count; ++i) {
++    max_row = std::max(max_row, b.steps[i].row);
++    max_ext_z = std::max(max_ext_z, b.steps[i].ext_z);
++  }
++  s.grid_x = (max_row + kPackBlockX - 1U) / kPackBlockX;
++  s.grid_y = std::min<uint32_t>(max_ext_z, 65535U);
++  s.grid_z = b.total_comps;
++  return s;
++}
++
+ /**
+  * One device thread of the gather kernel (field -> staging). Host+device so the same code runs
+  * in the CUDA/HIP kernel and in the host unit test.
+@@ -191,6 +238,52 @@ pack_scatter_thread(const W* CARBON_PACK_RESTRICT stage,
+   }
+ }
+ 
++/** One device thread of the batched gather kernel. */
++template <typename W>
++CARBON_HD inline void
++pack_gather_batch_thread(const W* CARBON_PACK_RESTRICT field,
++                         W* CARBON_PACK_RESTRICT stage,
++                         const PackBatchArgs& b,
++                         uint32_t bx,
++                         uint32_t by,
++                         uint32_t bz,
++                         uint32_t tx,
++                         uint32_t bdx,
++                         uint32_t gdy) {
++  if (bz >= b.total_comps) {
++    return;
++  }
++  uint32_t step = 0U;
++  while (step + 1U < b.step_count && bz >= b.prefix[step + 1U]) {
++    ++step;
++  }
++  pack_gather_thread<W>(field, stage + b.stage_offsets[step], b.steps[step], bx, by,
++                        bz - b.prefix[step], tx, bdx, gdy);
++}
++
++/** One device thread of the batched scatter kernel. */
++template <typename W>
++CARBON_HD inline void
++pack_scatter_batch_thread(const W* CARBON_PACK_RESTRICT stage,
++                          W* CARBON_PACK_RESTRICT field,
++                          const PackBatchArgs& b,
++                          uint32_t bx,
++                          uint32_t by,
++                          uint32_t bz,
++                          uint32_t tx,
++                          uint32_t bdx,
++                          uint32_t gdy) {
++  if (bz >= b.total_comps) {
++    return;
++  }
++  uint32_t step = 0U;
++  while (step + 1U < b.step_count && bz >= b.prefix[step + 1U]) {
++    ++step;
++  }
++  pack_scatter_thread<W>(stage + b.stage_offsets[step], field, b.steps[step], bx, by,
++                         bz - b.prefix[step], tx, bdx, gdy);
++}
++
+ /** Host reference of a full gather launch (used by tests and as executable documentation). */
+ template <typename W>
+ inline auto
+@@ -227,6 +320,48 @@ host_scatter(const W* stage,
+   }
+ }
+ 
++/** Host reference of a batched gather launch. */
++template <typename W>
++inline auto
++host_gather_batch(const W* field,
++                  W* stage,
++                  const PackBatchArgs& b) -> void {
++  if (b.step_count == 0U) {
++    return;
++  }
++  const PackLaunchShape s = pack_batch_launch_shape(b);
++  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
++    for (uint32_t by = 0; by < s.grid_y; ++by) {
++      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
++        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
++          pack_gather_batch_thread<W>(field, stage, b, bx, by, bz, tx, s.block_x, s.grid_y);
++        }
++      }
++    }
++  }
++}
++
++/** Host reference of a batched scatter launch. */
++template <typename W>
++inline auto
++host_scatter_batch(const W* stage,
++                   W* field,
++                   const PackBatchArgs& b) -> void {
++  if (b.step_count == 0U) {
++    return;
++  }
++  const PackLaunchShape s = pack_batch_launch_shape(b);
++  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
++    for (uint32_t by = 0; by < s.grid_y; ++by) {
++      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
++        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
++          pack_scatter_batch_thread<W>(stage, field, b, bx, by, bz, tx, s.block_x, s.grid_y);
++        }
++      }
++    }
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Plan
+ // ---------------------------------------------------------------------------
+@@ -242,6 +377,26 @@ struct PackStep {
+   size_t stage_offset{};  ///< element offset into the HaloDistributed's staging buffer
+ };
+ 
++/** Fold @p steps into one launch; returns @c step_count == 0 when they do not fit. */
++[[nodiscard]] inline auto
++make_pack_batch(const std::vector<PackStep>& steps) -> PackBatchArgs {
++  PackBatchArgs b;
++  if (steps.size() > kMaxPackBatchSteps) {
++    return b;
++  }
++  uint32_t total = 0U;
++  for (size_t i = 0; i < steps.size(); ++i) {
++    b.steps[i] = steps[i].args;
++    b.stage_offsets[i] = static_cast<int64_t>(steps[i].stage_offset);
++    b.prefix[i] = total;
++    total += steps[i].args.num_comps;
++  }
++  b.prefix[steps.size()] = total;
++  b.step_count = static_cast<uint32_t>(steps.size());
++  b.total_comps = total;
++  return b;
++}
++
+ /** One cross-rank message over a contiguous staging region. */
+ struct PackMsg {
+   int peer{};
+diff --git a/include/carbon/halo_distributed.h b/include/carbon/halo_distributed.h
+index d553bbf..c22e676 100644
+--- a/include/carbon/halo_distributed.h
++++ b/include/carbon/halo_distributed.h
+@@ -214,6 +214,11 @@ public:
+   dist_entry_count() const noexcept -> size_t {
+ #ifdef CARBON_HAVE_MPI_NCCL
+     if (!axis_passes_.empty()) {
++#if CARBON_BACKEND_IS_CUDALIKE
++      if (fused_pack_) {
++        return fused_dist_staged_.entry_count();
++      }
++#endif
+       size_t n = 0;
+       for (const AxisPass& pass : axis_passes_) {
+         n += pass.dist.entry_count();
+@@ -253,6 +258,22 @@ public:
+       stream.wait_for_all(fence_event_);
+     }
+     if (!axis_passes_.empty()) {
++#if CARBON_BACKEND_IS_CUDALIKE
++      // Face-only lattice stencils do not need the staged X -> Y -> Z dependency: every
++      // needed halo cell comes from an owned face, so all axes can share one gather, one NCCL
++      // group and one scatter. Diagonal stencils (D3Q19/D3Q27) and Standard semantics keep
++      // the staged passes below.
++      if (fused_pack_) {
++        run_pack_batch_(fused_gathers_, stream, /*gather=*/true);
++#ifdef CARBON_HAVE_MPI_NCCL
++        if (fused_dist_staged_.entry_count() > 0U) {
++          fused_dist_staged_(stream);
++        }
++#endif
++        run_pack_batch_(fused_scatters_, stream, /*gather=*/false);
++        return;
++      }
++#endif
+       for (size_t i = 0; i < axis_passes_.size(); ++i) {
+         const AxisPass& pass = axis_passes_[i];
+ 
+@@ -260,7 +281,7 @@ public:
+         // `stream`, so ordinary stream order (not a host barrier) sequences gather < comm < scatter
+         // and this pass < the next pass. Empty for Z passes and for run-based fallbacks.
+ #if CARBON_BACKEND_IS_CUDALIKE
+-        run_pack_steps_(pass.gathers, stream, /*gather=*/true);
++        run_pack_(pass.gathers, pass.gather_batch, stream, /*gather=*/true);
+ #endif
+         pass.intra(stream);
+ #ifdef CARBON_HAVE_MPI_NCCL
+@@ -270,7 +291,7 @@ public:
+ #endif
+ #endif
+ #if CARBON_BACKEND_IS_CUDALIKE
+-        run_pack_steps_(pass.scatters, stream, /*gather=*/false);
++        run_pack_(pass.scatters, pass.scatter_batch, stream, /*gather=*/false);
+ #endif
+ 
+         if (i + 1U < axis_passes_.size()) {
+@@ -435,8 +456,11 @@ private:
+     mutable Event fence_event{};
+ #if CARBON_BACKEND_IS_CUDALIKE
+     // Packed X/Y exchange (see detail/halo_pack_plan.h). Empty unless this pass was packed.
++    bool packed{false};
+     std::vector<detail::halo_pack::PackStep> gathers{};
+     std::vector<detail::halo_pack::PackStep> scatters{};
++    detail::halo_pack::PackBatchArgs gather_batch{};
++    detail::halo_pack::PackBatchArgs scatter_batch{};
+     std::vector<detail::halo_pack::PackMsg> staged_msgs{};
+ #ifdef CARBON_HAVE_MPI_NCCL
+     DistTransfer<T> dist_staged{};  ///< bound to HaloDistributed::stage_, not to the field buffer
+@@ -474,6 +498,43 @@ private:
+       }
+     }
+   }
++
++  /** Launch a folded batch; @p b must have been produced by make_pack_batch. */
++  auto
++  run_pack_batch_(const detail::halo_pack::PackBatchArgs& b,
++                  const Stream& stream,
++                  bool gather) const -> void {
++    if (b.step_count == 0U) {
++      return;
++    }
++    const detail::Gpu& gpu = field_.dense().system().gpu_group().devices()[0];
++    const detail::gpu_stream_t native = stream.native_at(0);
++    T* field_base = field_.gpu_buffers()[0].data();
++    T* stage_base = stage_[0].data();
++    const detail::gpu_error_t err =
++        gather ? detail::halo_pack::launch_gather_batch(gpu, native, sizeof(T), field_base,
++                                                        stage_base, b)
++               : detail::halo_pack::launch_scatter_batch(gpu, native, sizeof(T), stage_base,
++                                                         field_base, b);
++    if (err != detail::gpu_success) {
++      log::throw_with_log<std::runtime_error>(
++          "HaloDistributed batched packed {} kernel launch failed: {}",
++          gather ? "gather" : "scatter", detail::gpu_error_string(err));
++    }
++  }
++
++  /** Prefer the folded launch, falling back to one launch per step when it does not fit. */
++  auto
++  run_pack_(const std::vector<detail::halo_pack::PackStep>& steps,
++            const detail::halo_pack::PackBatchArgs& b,
++            const Stream& stream,
++            bool gather) const -> void {
++    if (b.step_count > 0U) {
++      run_pack_batch_(b, stream, gather);
++    } else {
++      run_pack_steps_(steps, stream, gather);
++    }
++  }
+ #endif
+ 
+   DenseDistributed::Field<T, Components> field_{};
+@@ -493,6 +554,14 @@ private:
+   // One contiguous staging buffer shared by every packed pass (single local GPU only). Allocated
+   // in the constructor so no allocation can land inside graph capture or a timed region.
+   Buffer<T> stage_{};
++  // Face-only stencils fold every packed axis into one gather/NCCL/scatter group.
++  bool fused_pack_{false};
++  detail::halo_pack::PackBatchArgs fused_gathers_{};
++  detail::halo_pack::PackBatchArgs fused_scatters_{};
++  std::vector<detail::halo_pack::PackMsg> fused_staged_msgs_{};
++#ifdef CARBON_HAVE_MPI_NCCL
++  DistTransfer<T> fused_dist_staged_{};
++#endif
+ #endif
+   // See operator(): host barrier between axis passes. CARBON_HALO_PASS_BARRIER=1 enables it.
+   bool pass_barrier_{false};
+@@ -1091,8 +1160,11 @@ HaloDistributed<T,
+ 
+ #if CARBON_BACKEND_IS_CUDALIKE
+     if (pack_axis) {
++      pass.packed = true;
+       pass.gathers = std::move(pack_plan.gathers);
+       pass.scatters = std::move(pack_plan.scatters);
++      pass.gather_batch = detail::halo_pack::make_pack_batch(pass.gathers);
++      pass.scatter_batch = detail::halo_pack::make_pack_batch(pass.scatters);
+       pass.staged_msgs = std::move(pack_plan.msgs);
+     }
+ #endif
+@@ -1127,6 +1199,57 @@ HaloDistributed<T,
+       pass.dist_staged = staged.finalise(dense.system(), stage_);
+     }
+ #endif
++
++    // A face-only stencil has no cell that depends on two axes at once, so the staged
++    // X -> Y -> Z dependency disappears. Fold every packed axis into one gather, one NCCL
++    // group and one scatter. Diagonal stencils keep the per-axis passes.
++    const bool face_only_stencil = std::all_of(
++        stencil_.points().begin(), stencil_.points().end(), [](const int8_3d& p) {
++          const int axes = static_cast<int>(p.x != 0) + static_cast<int>(p.y != 0) +
++                           static_cast<int>(p.z != 0);
++          return axes <= 1;
++        });
++    bool all_packed = axis_passes_.size() > 1U;
++    size_t gather_steps = 0U;
++    size_t scatter_steps = 0U;
++    for (const AxisPass& pass : axis_passes_) {
++      all_packed = all_packed && pass.packed;
++      gather_steps += pass.gathers.size();
++      scatter_steps += pass.scatters.size();
++    }
++    // Standard semantics copies the full boundary plane, corners included, so it keeps the
++    // staged passes even when the stencil itself has no diagonal offsets.
++    if (pack_ok && semantic_ != StencilSemantic::Standard && face_only_stencil && all_packed &&
++        gather_steps <= detail::halo_pack::kMaxPackBatchSteps &&
++        scatter_steps <= detail::halo_pack::kMaxPackBatchSteps) {
++      std::vector<detail::halo_pack::PackStep> gathers;
++      std::vector<detail::halo_pack::PackStep> scatters;
++      for (const AxisPass& pass : axis_passes_) {
++        gathers.insert(gathers.end(), pass.gathers.begin(), pass.gathers.end());
++        scatters.insert(scatters.end(), pass.scatters.begin(), pass.scatters.end());
++        fused_staged_msgs_.insert(fused_staged_msgs_.end(), pass.staged_msgs.begin(),
++                                  pass.staged_msgs.end());
++      }
++      fused_gathers_ = detail::halo_pack::make_pack_batch(gathers);
++      fused_scatters_ = detail::halo_pack::make_pack_batch(scatters);
++      if (fused_gathers_.step_count > 0U && fused_scatters_.step_count > 0U) {
++        fused_pack_ = true;
++#ifdef CARBON_HAVE_MPI_NCCL
++        if (!fused_staged_msgs_.empty()) {
++          detail::halo_pack::sort_msgs(fused_staged_msgs_);
++          detail::halo_build::DistTransferBuilder<T> staged;
++          for (const detail::halo_pack::PackMsg& m : fused_staged_msgs_) {
++            staged.push(m.peer, m.op == detail::halo_pack::MsgOp::Send ? DistOp::Send
++                                                                        : DistOp::Recv,
++                        m.first, m.count);
++          }
++          fused_dist_staged_ = staged.finalise(dense.system(), stage_);
++        }
++#endif
++      } else {
++        fused_staged_msgs_.clear();
++      }
++    }
+   }
+ #endif
+ }
+diff --git a/src/halo_pack.cu b/src/halo_pack.cu
+index 2074f7e..e483f21 100644
+--- a/src/halo_pack.cu
++++ b/src/halo_pack.cu
+@@ -37,6 +37,24 @@ scatter_kernel(const W* __restrict__ stage,
+                          blockDim.x, gridDim.y);
+ }
+ 
++template <typename W>
++__global__ void
++gather_batch_kernel(const W* __restrict__ field,
++                    W* __restrict__ stage,
++                    PackBatchArgs b) {
++  pack_gather_batch_thread<W>(field, stage, b, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
++                              blockDim.x, gridDim.y);
++}
++
++template <typename W>
++__global__ void
++scatter_batch_kernel(const W* __restrict__ stage,
++                     W* __restrict__ field,
++                     PackBatchArgs b) {
++  pack_scatter_batch_thread<W>(stage, field, b, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
++                               blockDim.x, gridDim.y);
++}
++
+ template <typename W>
+ auto
+ gather_as(const Gpu& gpu,
+@@ -63,6 +81,32 @@ scatter_as(const Gpu& gpu,
+       static_cast<const W*>(stage), static_cast<W*>(field), a);
+ }
+ 
++template <typename W>
++auto
++gather_batch_as(const Gpu& gpu,
++                gpu_stream_t stream,
++                const void* field,
++                void* stage,
++                const PackBatchArgs& b) -> gpu_error_t {
++  const PackLaunchShape s = pack_batch_launch_shape(b);
++  return gpu.template typed_launch<&gather_batch_kernel<W>>(
++      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
++      static_cast<const W*>(field), static_cast<W*>(stage), b);
++}
++
++template <typename W>
++auto
++scatter_batch_as(const Gpu& gpu,
++                 gpu_stream_t stream,
++                 const void* stage,
++                 void* field,
++                 const PackBatchArgs& b) -> gpu_error_t {
++  const PackLaunchShape s = pack_batch_launch_shape(b);
++  return gpu.template typed_launch<&scatter_batch_kernel<W>>(
++      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
++      static_cast<const W*>(stage), static_cast<W*>(field), b);
++}
++
+ }  // namespace
+ 
+ auto
+@@ -111,4 +155,56 @@ launch_scatter(const Gpu& gpu,
+   }
+ }
+ 
++auto
++launch_gather_batch(const Gpu& gpu,
++                    gpu_stream_t stream,
++                    std::size_t elem_bytes,
++                    const void* field_base,
++                    void* stage_base,
++                    const PackBatchArgs& b) -> gpu_error_t {
++  if (b.step_count == 0U) {
++    return gpu_success;
++  }
++  switch (elem_bytes) {
++    case 1U:
++      return gather_batch_as<std::uint8_t>(gpu, stream, field_base, stage_base, b);
++    case 2U:
++      return gather_batch_as<std::uint16_t>(gpu, stream, field_base, stage_base, b);
++    case 4U:
++      return gather_batch_as<std::uint32_t>(gpu, stream, field_base, stage_base, b);
++    case 8U:
++      return gather_batch_as<std::uint64_t>(gpu, stream, field_base, stage_base, b);
++    case 16U:
++      return gather_batch_as<Word16>(gpu, stream, field_base, stage_base, b);
++    default:
++      return gpu_error_invalid_value;
++  }
++}
++
++auto
++launch_scatter_batch(const Gpu& gpu,
++                     gpu_stream_t stream,
++                     std::size_t elem_bytes,
++                     const void* stage_base,
++                     void* field_base,
++                     const PackBatchArgs& b) -> gpu_error_t {
++  if (b.step_count == 0U) {
++    return gpu_success;
++  }
++  switch (elem_bytes) {
++    case 1U:
++      return scatter_batch_as<std::uint8_t>(gpu, stream, stage_base, field_base, b);
++    case 2U:
++      return scatter_batch_as<std::uint16_t>(gpu, stream, stage_base, field_base, b);
++    case 4U:
++      return scatter_batch_as<std::uint32_t>(gpu, stream, stage_base, field_base, b);
++    case 8U:
++      return scatter_batch_as<std::uint64_t>(gpu, stream, stage_base, field_base, b);
++    case 16U:
++      return scatter_batch_as<Word16>(gpu, stream, stage_base, field_base, b);
++    default:
++      return gpu_error_invalid_value;
++  }
++}
++
+ }  // namespace carbon::detail::halo_pack
+diff --git a/tests/test_dense_distributed_host.cpp b/tests/test_dense_distributed_host.cpp
+index 9ef5f4c..69259fd 100644
+--- a/tests/test_dense_distributed_host.cpp
++++ b/tests/test_dense_distributed_host.cpp
+@@ -83,7 +83,7 @@ lattice(int q) -> std::vector<Vel> {
+     for (int y = -1; y <= 1; ++y) {
+       for (int x = -1; x <= 1; ++x) {
+         const int nz = (x != 0) + (y != 0) + (z != 0);
+-        if (q == 27 || (q == 19 && nz <= 2)) {
++        if (q == 27 || (q == 19 && nz <= 2) || (q == 7 && nz <= 1)) {
+           v.push_back({x, y, z});
+         }
+       }
+@@ -321,6 +321,12 @@ exchange_packed(World& w,
+ 
+   // 1) gather everywhere (before any message is delivered or scattered).
+   for (size_t i = 0; i < w.ranks.size(); ++i) {
++    const hp::PackBatchArgs gb = hp::make_pack_batch(plans[i].gathers);
++    if (gb.step_count > 0U) {
++      hp::host_gather_batch<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data(), gb);
++      ++stats.kernels;
++      continue;
++    }
+     for (const hp::PackStep& s : plans[i].gathers) {
+       hp::host_gather<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data() + s.stage_offset,
+                                 s.args);
+@@ -360,6 +366,12 @@ exchange_packed(World& w,
+ 
+   // 3) scatter everywhere.
+   for (size_t i = 0; i < w.ranks.size(); ++i) {
++    const hp::PackBatchArgs sb = hp::make_pack_batch(plans[i].scatters);
++    if (sb.step_count > 0U) {
++      hp::host_scatter_batch<uint64_t>(w.ranks[i].stage.data(), w.ranks[i].buf.data(), sb);
++      ++stats.kernels;
++      continue;
++    }
+     for (const hp::PackStep& s : plans[i].scatters) {
+       hp::host_scatter<uint64_t>(w.ranks[i].stage.data() + s.stage_offset, w.ranks[i].buf.data(),
+                                  s.args);
+@@ -369,6 +381,94 @@ exchange_packed(World& w,
+   return stats;
+ }
+ 
++// Face-only fusion: every axis shares one gather, one message group and one scatter. This is the
++// host mirror of HaloDistributed's fused_pack_ path (no X -> Y -> Z dependency).
++auto
++exchange_packed_fused(World& w,
++                      std::vector<size_t>& stage_cursor) -> PassStats {
++  PassStats stats;
++  constexpr std::array<Axis, 3> axes{Axis::X, Axis::Y, Axis::Z};
++  std::array<std::vector<hp::AxisPackPlan>, axes.size()> plans;
++  for (auto& per_rank : plans) {
++    per_rank.resize(w.ranks.size());
++  }
++
++  for (size_t i = 0; i < w.ranks.size(); ++i) {
++    Rank& rk = w.ranks[i];
++    for (size_t a = 0; a < axes.size(); ++a) {
++      plans[a][i] = hp::build_axis_pack_plan(
++          w.pg, w.bm, rk.coords, static_cast<int32_t>(i), rk.g, axes[a], w.comps,
++          rk.comp_stride,
++          [&](int c, Axis ax, AxisSide sd) {
++            return w.active_send(c, ax, sd);
++          },
++          [&](int c, Axis ax, AxisSide sd) {
++            return w.active_recv(c, ax, sd);
++          },
++          stage_cursor[i]);
++      hp::sort_msgs(plans[a][i].msgs);
++      stage_cursor[i] += plans[a][i].stage_elems;
++      rk.stage.resize(std::max(rk.stage.size(), stage_cursor[i]), kSentinel);
++    }
++  }
++
++  for (size_t i = 0; i < w.ranks.size(); ++i) {
++    std::vector<hp::PackStep> steps;
++    for (const auto& per_rank : plans) {
++      steps.insert(steps.end(), per_rank[i].gathers.begin(), per_rank[i].gathers.end());
++    }
++    const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
++    CHECK(batch.step_count == steps.size());
++    hp::host_gather_batch<uint64_t>(w.ranks[i].buf.data(), w.ranks[i].stage.data(), batch);
++    ++stats.kernels;
++  }
++
++  // Per-axis plans are already key-sorted. Iterating axes in X/Y/Z order makes the combined
++  // per-peer order identical on both ends (the key starts with the axis id), matching sort_msgs.
++  std::map<std::pair<int, int>, std::vector<const hp::PackMsg*>> sends;
++  std::map<std::pair<int, int>, std::vector<const hp::PackMsg*>> recvs;
++  for (size_t i = 0; i < w.ranks.size(); ++i) {
++    for (const auto& per_rank : plans) {
++      for (const hp::PackMsg& m : per_rank[i].msgs) {
++        ++stats.msgs;
++        if (m.op == hp::MsgOp::Send) {
++          sends[{static_cast<int>(i), m.peer}].push_back(&m);
++        } else {
++          recvs[{m.peer, static_cast<int>(i)}].push_back(&m);
++        }
++      }
++    }
++  }
++  CHECK(sends.size() == recvs.size());
++  for (const auto& [pair, slist] : sends) {
++    const auto it = recvs.find(pair);
++    CHECK(it != recvs.end());
++    const auto& rlist = it->second;
++    CHECK(slist.size() == rlist.size());
++    for (size_t k = 0; k < slist.size(); ++k) {
++      CHECK(slist[k]->count == rlist[k]->count);
++      CHECK(slist[k]->key == rlist[k]->key);
++      const Rank& s = w.ranks[static_cast<size_t>(pair.first)];
++      Rank& d = w.ranks[static_cast<size_t>(pair.second)];
++      std::copy_n(s.stage.begin() + static_cast<std::ptrdiff_t>(slist[k]->first),
++                  static_cast<std::ptrdiff_t>(slist[k]->count),
++                  d.stage.begin() + static_cast<std::ptrdiff_t>(rlist[k]->first));
++    }
++  }
++
++  for (size_t i = 0; i < w.ranks.size(); ++i) {
++    std::vector<hp::PackStep> steps;
++    for (const auto& per_rank : plans) {
++      steps.insert(steps.end(), per_rank[i].scatters.begin(), per_rank[i].scatters.end());
++    }
++    const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
++    CHECK(batch.step_count == steps.size());
++    hp::host_scatter_batch<uint64_t>(w.ranks[i].stage.data(), w.ranks[i].buf.data(), batch);
++    ++stats.kernels;
++  }
++  return stats;
++}
++
+ // ---- ground truth -------------------------------------------------------------------------
+ // Returns true and the wrapped global coordinate if the cell exists in the global domain.
+ auto
+@@ -576,9 +676,14 @@ part_a_roundtrip() -> void {
+       CHECK(steps.size() == (cl.size() + hp::kMaxPackComps - 1) / hp::kMaxPackComps);
+       CHECK(steps.size() >= 2U);
+       std::vector<W> stage(cl.size() * box.volume(), make_elem<W>(0));
+-      for (const auto& s : steps) {
+-        hp::host_gather<W>(field.data(), stage.data() + s.stage_offset, s.args);
++      const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
++      CHECK(batch.step_count == steps.size());
++      std::vector<hp::PackStep> too_many = steps;
++      while (too_many.size() <= hp::kMaxPackBatchSteps) {
++        too_many.push_back(steps.front());
+       }
++      CHECK(hp::make_pack_batch(too_many).step_count == 0U);  // caller must fall back
++      hp::host_gather_batch<W>(field.data(), stage.data(), batch);
+       // Against an explicit triple loop.
+       size_t n = 0;
+       for (const int c : cl) {
+@@ -597,9 +702,7 @@ part_a_roundtrip() -> void {
+       CHECK(n == stage.size());
+       // Scatter into a clean field: writes exactly the box cells of exactly the listed comps.
+       std::vector<W> out(field.size(), make_elem<W>(0));
+-      for (const auto& s : steps) {
+-        hp::host_scatter<W>(stage.data() + s.stage_offset, out.data(), s.args);
+-      }
++      hp::host_scatter_batch<W>(stage.data(), out.data(), batch);
+       size_t written = 0;
+       for (size_t i = 0; i < out.size(); ++i) {
+         if (!(out[i] == make_elem<W>(0))) {
+@@ -646,6 +749,12 @@ part_a_launch_shapes() -> void {
+       hp::detail_plan::append_steps(steps, box, cl, g, cs, 0);
+       CHECK(steps.size() == 1U);
+       const hp::PackLaunchShape ls = hp::pack_launch_shape(steps[0].args);
++      const hp::PackBatchArgs batch = hp::make_pack_batch(steps);
++      const hp::PackLaunchShape bs = hp::pack_batch_launch_shape(batch);
++      CHECK(batch.step_count == 1U);
++      CHECK(bs.grid_x == ls.grid_x);
++      CHECK(bs.grid_y == ls.grid_y);
++      CHECK(bs.grid_z == static_cast<uint32_t>(cl.size()));
+       if (axis == Axis::X && sh.oy == 300) {
+         CHECK(ls.grid_x == 2U);  // 300 rows over 256-thread blocks
+       }
+@@ -653,7 +762,7 @@ part_a_launch_shapes() -> void {
+         CHECK(ls.grid_y == 65535U);  // capped: the grid-stride loop must cover the rest
+       }
+       std::vector<uint32_t> stage(cl.size() * box.volume(), 0U);
+-      hp::host_gather<uint32_t>(field.data(), stage.data(), steps[0].args);
++      hp::host_gather_batch<uint32_t>(field.data(), stage.data(), batch);
+       size_t n = 0;
+       for (const int c : cl) {
+         for (int64_t z = 0; z < box.ext_z; ++z) {
+@@ -1389,6 +1498,11 @@ run_scenario(const Scenario& s,
+   // New path: packed X, Y; Z is packed iff it carries several components (Halo's rule), else it
+   // stays on the run-based path (a single contiguous run per side).
+   const bool pack_z = packed.comps > 1;
++  const bool lattice_face_only = s.lattice_q == 7;
++  const int active_axes = static_cast<int>(s.hx > 0) + static_cast<int>(s.hy > 0) +
++                          static_cast<int>(s.hz > 0);
++  const bool fuse_candidate = lattice_face_only && pack_z && active_axes > 1;
++  World fused = fuse_candidate ? packed : World{};
+   std::vector<size_t> cursor(packed.ranks.size(), 0);
+   for (const Axis a : {Axis::X, Axis::Y}) {
+     const PassStats st = exchange_packed(packed, a, cursor);
+@@ -1407,6 +1521,11 @@ run_scenario(const Scenario& s,
+              false);  // oracle: right on needed cells (it clobbers exterior halos, by design)...
+   total_checked +=
+       verify(packed, &oracle, true, pack_z);  // ...and the packed result must match it bit for bit
++  if (fuse_candidate) {
++    std::vector<size_t> fused_cursor(fused.ranks.size(), 0);
++    exchange_packed_fused(fused, fused_cursor);
++    total_checked += verify(fused, &oracle, true, pack_z);
++  }
+   if (packed.semantic == Semantic::LatticeDistributed) {
+     const size_t face_checked = verify_lattice_distributed_faces(oracle) +
+                                 verify_lattice_distributed_faces(packed);
+@@ -1464,6 +1583,7 @@ main() {
+       sc.push_back({"d3q19", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0});
+       sc.push_back({"d3q27", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5});
+       sc.push_back({"d3q19-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 19, 0, true});
++      sc.push_back({"d3q7-dist", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 7, 0, true});
+       sc.push_back({"d3q27-dist-pad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 0, 27, 5, true});
+       // Opt-in row/component padding: the packed and run-based paths must still agree.
+       sc.push_back({"std-h111-rowpad", g.x, g.y, g.z, bm, 11, 9, 10, 1, 1, 1, 3, 0, 0, false,

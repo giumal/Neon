@@ -71,6 +71,17 @@ using halo_distributed_build::AxisSide;
 
 /** Maximum components packed by one kernel launch (kernel argument struct is fixed-size). */
 inline constexpr uint32_t kMaxPackComps = 32U;
+/**
+ * Maximum pack steps folded into one batched kernel launch.
+ *
+ * The batch argument block is passed by value, so it must stay below the portable
+ * kernel-parameter limit (4 KiB on older CUDA/HIP toolchains). A pass with more steps
+ * falls back to one launch per step; the host planner reports that by leaving
+ * @c PackBatchArgs::step_count at zero.
+ */
+inline constexpr uint32_t kMaxPackBatchSteps = 8U;
+static_assert(kMaxPackBatchSteps * kMaxPackComps <= 65535U,
+              "batched pack grid.z must fit the portable CUDA/HIP grid limit");
 /** Threads per block along x for pack/unpack kernels. */
 inline constexpr uint32_t kPackBlockX = 256U;
 
@@ -121,6 +132,25 @@ struct PackLaunchShape {
   uint32_t block_x{};
 };
 
+/**
+ * Several @ref PackKernelArgs folded into one kernel launch.
+ *
+ * @c grid.z is the total number of component planes across all steps; the kernel maps
+ * that flat index back to a step through @c prefix. @c stage_offsets are absolute element
+ * offsets into the shared staging buffer, so one launch can cover several sides/axes.
+ * @c step_count == 0 means "too large for one launch" and callers must fall back.
+ */
+struct PackBatchArgs {
+  uint32_t step_count{};
+  uint32_t total_comps{};
+  uint32_t prefix[kMaxPackBatchSteps + 1U]{};
+  PackKernelArgs steps[kMaxPackBatchSteps]{};
+  int64_t stage_offsets[kMaxPackBatchSteps]{};
+};
+
+static_assert(sizeof(PackBatchArgs) <= 4096U,
+              "PackBatchArgs must fit the portable CUDA/HIP kernel-parameter limit");
+
 /** Launch geometry: x = flattened (x,y) row, y = grid-stride over z, z = packed component. */
 [[nodiscard]] inline auto
 pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
@@ -129,6 +159,23 @@ pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
   s.grid_x = (a.row + kPackBlockX - 1U) / kPackBlockX;
   s.grid_y = std::min<uint32_t>(a.ext_z, 65535U);
   s.grid_z = a.num_comps;
+  return s;
+}
+
+/** Launch geometry for a folded batch: x/y cover the widest step, z covers every component. */
+[[nodiscard]] inline auto
+pack_batch_launch_shape(const PackBatchArgs& b) noexcept -> PackLaunchShape {
+  PackLaunchShape s;
+  s.block_x = kPackBlockX;
+  uint32_t max_row = 0U;
+  uint32_t max_ext_z = 0U;
+  for (uint32_t i = 0; i < b.step_count; ++i) {
+    max_row = std::max(max_row, b.steps[i].row);
+    max_ext_z = std::max(max_ext_z, b.steps[i].ext_z);
+  }
+  s.grid_x = (max_row + kPackBlockX - 1U) / kPackBlockX;
+  s.grid_y = std::min<uint32_t>(max_ext_z, 65535U);
+  s.grid_z = b.total_comps;
   return s;
 }
 
@@ -191,6 +238,52 @@ pack_scatter_thread(const W* CARBON_PACK_RESTRICT stage,
   }
 }
 
+/** One device thread of the batched gather kernel. */
+template <typename W>
+CARBON_HD inline void
+pack_gather_batch_thread(const W* CARBON_PACK_RESTRICT field,
+                         W* CARBON_PACK_RESTRICT stage,
+                         const PackBatchArgs& b,
+                         uint32_t bx,
+                         uint32_t by,
+                         uint32_t bz,
+                         uint32_t tx,
+                         uint32_t bdx,
+                         uint32_t gdy) {
+  if (bz >= b.total_comps) {
+    return;
+  }
+  uint32_t step = 0U;
+  while (step + 1U < b.step_count && bz >= b.prefix[step + 1U]) {
+    ++step;
+  }
+  pack_gather_thread<W>(field, stage + b.stage_offsets[step], b.steps[step], bx, by,
+                        bz - b.prefix[step], tx, bdx, gdy);
+}
+
+/** One device thread of the batched scatter kernel. */
+template <typename W>
+CARBON_HD inline void
+pack_scatter_batch_thread(const W* CARBON_PACK_RESTRICT stage,
+                          W* CARBON_PACK_RESTRICT field,
+                          const PackBatchArgs& b,
+                          uint32_t bx,
+                          uint32_t by,
+                          uint32_t bz,
+                          uint32_t tx,
+                          uint32_t bdx,
+                          uint32_t gdy) {
+  if (bz >= b.total_comps) {
+    return;
+  }
+  uint32_t step = 0U;
+  while (step + 1U < b.step_count && bz >= b.prefix[step + 1U]) {
+    ++step;
+  }
+  pack_scatter_thread<W>(stage + b.stage_offsets[step], field, b.steps[step], bx, by,
+                         bz - b.prefix[step], tx, bdx, gdy);
+}
+
 /** Host reference of a full gather launch (used by tests and as executable documentation). */
 template <typename W>
 inline auto
@@ -227,6 +320,48 @@ host_scatter(const W* stage,
   }
 }
 
+/** Host reference of a batched gather launch. */
+template <typename W>
+inline auto
+host_gather_batch(const W* field,
+                  W* stage,
+                  const PackBatchArgs& b) -> void {
+  if (b.step_count == 0U) {
+    return;
+  }
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
+    for (uint32_t by = 0; by < s.grid_y; ++by) {
+      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
+        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+          pack_gather_batch_thread<W>(field, stage, b, bx, by, bz, tx, s.block_x, s.grid_y);
+        }
+      }
+    }
+  }
+}
+
+/** Host reference of a batched scatter launch. */
+template <typename W>
+inline auto
+host_scatter_batch(const W* stage,
+                   W* field,
+                   const PackBatchArgs& b) -> void {
+  if (b.step_count == 0U) {
+    return;
+  }
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
+    for (uint32_t by = 0; by < s.grid_y; ++by) {
+      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
+        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+          pack_scatter_batch_thread<W>(stage, field, b, bx, by, bz, tx, s.block_x, s.grid_y);
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Plan
 // ---------------------------------------------------------------------------
@@ -241,6 +376,26 @@ struct PackStep {
   PackKernelArgs args{};
   size_t stage_offset{};  ///< element offset into the HaloDistributed's staging buffer
 };
+
+/** Fold @p steps into one launch; returns @c step_count == 0 when they do not fit. */
+[[nodiscard]] inline auto
+make_pack_batch(const std::vector<PackStep>& steps) -> PackBatchArgs {
+  PackBatchArgs b;
+  if (steps.size() > kMaxPackBatchSteps) {
+    return b;
+  }
+  uint32_t total = 0U;
+  for (size_t i = 0; i < steps.size(); ++i) {
+    b.steps[i] = steps[i].args;
+    b.stage_offsets[i] = static_cast<int64_t>(steps[i].stage_offset);
+    b.prefix[i] = total;
+    total += steps[i].args.num_comps;
+  }
+  b.prefix[steps.size()] = total;
+  b.step_count = static_cast<uint32_t>(steps.size());
+  b.total_comps = total;
+  return b;
+}
 
 /** One cross-rank message over a contiguous staging region. */
 struct PackMsg {
