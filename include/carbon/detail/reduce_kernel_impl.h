@@ -278,10 +278,6 @@ public:
             cub_temp_bytes_[g_idx], /*relative_gpu_id=*/static_cast<int>(g_idx));
       }
     }
-    {
-      const detail::Gpu& root = grid_.system().gpu_group().devices()[0U];
-      merge_pair_scratch_ = root.template buffer<T>(2U, /*relative_gpu_id=*/0);
-    }
 #elif CARBON_BACKEND_IS_SYCL
     // SYCL: nothing to allocate up front — sycl::reduction owns its own per-work-group
     // scratch. The per-GPU total/block counts above are still computed for parity with
@@ -593,20 +589,14 @@ public:
       log::throw_with_log<std::runtime_error>(
           "Kernel::reduce::launch_merge: gpu_set_device failed");
     }
-    // Merge runs after both Partials; reuse Standard stage-2 staging (gpu_count>=2) or
-    // the dedicated 2-element scratch (single-GPU).
-    T* staging = dst.gpu_count() > 1U ? dst.stage2_staging(DataView::Standard).data()
-                                      : merge_pair_scratch_.data();
+    // Merge runs after both Partials. Fold the two per-view scalars directly so the
+    // merge costs one kernel launch instead of two D2D copies plus a staged fold.
     T* const out = dst.device_data(DataView::Standard);
     const T* const internal = dst.device_data(DataView::Internal);
     const T* const boundary = dst.device_data(DataView::Boundary);
     const gpu_stream_t cuda_stream = stream[static_cast<size_t>(root_gpu_idx)].get();
-    const gpu_error_t c0 = gpu_memcpy_async_default(staging, internal, sizeof(T), cuda_stream);
-    const gpu_error_t c1 = gpu_memcpy_async_default(staging + 1, boundary, sizeof(T), cuda_stream);
-    if (c0 != gpu_success || c1 != gpu_success) {
-      log::throw_with_log<std::runtime_error>("Kernel::reduce::launch_merge: D2D copy failed");
-    }
-    dense::launch_combine_partials<T, Op>(root_gpu.device_id(), cuda_stream, staging, out, 2, op_);
+    dense::launch_combine_pair<T, Op>(root_gpu.device_id(), cuda_stream, internal, boundary, out,
+                                      op_);
     reduce_stages::run_stage3_cross_rank<T, Op>(grid_.system(), stream, dst, DataView::Standard);
     if (reduce_options_.host_copy == reduce::ReduceHostCopy::Inline) {
       const size_t slot = dst.active_slot();
@@ -629,20 +619,7 @@ public:
     T* const out = dst.device_data(DataView::Standard);
     const T* const internal = dst.device_data(DataView::Internal);
     const T* const boundary = dst.device_data(DataView::Boundary);
-    // Copy Op and the identity into locals so the device lambda captures no `this`
-    // pointer; the single_task folds the two already-combined Partial scalars.
-    const Op op = op_;
-    const T init = op.identity();
-    try {
-      q.submit([&](sycl::handler& cgh) {
-        cgh.single_task([op, init, out, internal, boundary]() {
-          *out = op(op(init, *internal), *boundary);
-        });
-      });
-    } catch (const sycl::exception& ex) {
-      log::throw_with_log<std::runtime_error>(
-          "Kernel::reduce::launch_merge: SYCL submission failed: {}", ex.what());
-    }
+    dense::launch_combine_pair<T, Op>(q, internal, boundary, out, op_);
 
     reduce_stages::run_stage3_cross_rank<T, Op>(grid_.system(), stream, dst,
                                                 DataView::Standard);
@@ -677,7 +654,8 @@ public:
 
   /**
    * Number of CUDA blocks launched by stage 1 for the @c Standard view, summed across
-   * local GPUs (matches the legacy single-GPU contract — see @ref total_cells ).
+   * local GPUs. DenseDistributed 1-D launches are capped at
+   * @c dense_distributed::kReduceMaxStage1Blocks because their kernel grid-strides.
    */
   [[nodiscard]] auto
   block_count() const noexcept -> int64_t {
@@ -730,7 +708,6 @@ private:
 #if CARBON_BACKEND_IS_CUDALIKE && CARBON_CUDALIKE_DEVICE_TU
   /** Per-view per-GPU stage-1 block partials (concurrent Partial I/B safe). */
   std::array<std::vector<detail::Allocation<T>>, ReductionResult<T>::kViewCount> partials_{};
-  detail::Allocation<T> merge_pair_scratch_{};
   std::vector<size_t> cub_temp_bytes_{};
   std::array<std::vector<detail::Allocation<std::byte>>, ReductionResult<T>::kViewCount>
       cub_temp_storage_{};

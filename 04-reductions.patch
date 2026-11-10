@@ -1,0 +1,517 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 2bbe37f..4ceb61f 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -6265,3 +6265,14 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
+   (D3Q19/D3Q27) and `Standard` semantics (which copy full boundary planes, corners included)
+   keep the staged passes. The host test now drives the batched gather/scatter, checks the
+   over-limit fallback, and compares a fused D3Q7 exchange against the staged oracle.
++
++- **2026-11 — §3.7 reduction launch and index-math overhead reduced.** `DenseDistributed`
++  stage-1 CUDA reductions now launch a capped grid-stride grid (`kReduceMaxStage1Blocks`, 512)
++  instead of one block per 256 cells, so production domains write hundreds of partials rather
++  than tens of thousands. The loop carries `(ix, iy, iz)` forward with precomputed per-stride
++  increments, avoiding the four 64-bit div/mod decode per cell. `Span` caches the six-box
++  Boundary shell and its prefix sums at construction, so `iter_extent(Boundary)` and
++  `set_and_validate(Boundary)` no longer rebuild the band geometry per thread. The skeleton's
++  Internal + Boundary + Merge path now folds the two per-view scalars with a direct pair
++  kernel, dropping two D2D staging copies per merge on CUDA/HIP (and using the matching SYCL
++  helper).
+diff --git a/include/carbon/detail/backend/cudalike/dense_distributed_reduce_kernel.h b/include/carbon/detail/backend/cudalike/dense_distributed_reduce_kernel.h
+index a9b1ed7..a474b4e 100644
+--- a/include/carbon/detail/backend/cudalike/dense_distributed_reduce_kernel.h
++++ b/include/carbon/detail/backend/cudalike/dense_distributed_reduce_kernel.h
+@@ -48,6 +48,15 @@ concept dense_reduce_fn = std::is_invocable_r_v<T, F, Span, Idx>;
+  */
+ constexpr int kReduceBlockThreads = 256;
+ 
++/**
++ * Upper bound on stage-1 CUDA blocks per GPU. A flat launch would otherwise emit one
++ * block per @c kReduceBlockThreads cells (tens of thousands on production domains), and
++ * every block writes one partial that CUB then folds. A capped grid-stride launch keeps
++ * the same coverage with at most this many partials, which is enough to fill current
++ * GPUs while making stage 1.5 a tiny reduction instead of a large one.
++ */
++constexpr int kReduceMaxStage1Blocks = 512;
++
+ #if CARBON_CUDALIKE_DEVICE_TU
+ 
+ /**
+@@ -69,19 +78,38 @@ dense_grid_reduce_kernel_t(Span span,
+   using BlockReduceT = gpucub::BlockReduce<T, BlockThreads>;
+   __shared__ typename BlockReduceT::TempStorage temp_storage;
+ 
+-  const int64_t flat =
++  const int64_t start =
+       static_cast<int64_t>(blockIdx.x) * BlockThreads + static_cast<int64_t>(threadIdx.x);
++  const int64_t stride =
++      static_cast<int64_t>(gridDim.x) * static_cast<int64_t>(BlockThreads);
+ 
+   T thread_val = init;
+-  if (flat < total_cells) {
++  if (start < total_cells) {
+     const ::carbon::int64_3d ext = span.iter_extent(view);
+-    const int64_t ix = flat % ext.x;
+-    const int64_t rest = flat / ext.x;
+-    const int64_t iy = rest % ext.y;
+-    const int64_t iz = rest / ext.y;
+-    const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
+-    if (vi.valid) {
+-      thread_val = fn(span, vi.idx);
++    int64_t ix = start % ext.x;
++    int64_t rest = start / ext.x;
++    int64_t iy = rest % ext.y;
++    int64_t iz = rest / ext.y;
++    const int64_t step_x = stride % ext.x;
++    const int64_t step_yz = stride / ext.x;
++    const int64_t step_y = step_yz % ext.y;
++    const int64_t step_z = step_yz / ext.y;
++    for (int64_t flat = start; flat < total_cells; flat += stride) {
++      const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
++      if (vi.valid) {
++        thread_val = op(thread_val, fn(span, vi.idx));
++      }
++      ix += step_x;
++      if (ix >= ext.x) {
++        ix -= ext.x;
++        ++iy;
++      }
++      iy += step_y;
++      if (iy >= ext.y) {
++        iy -= ext.y;
++        ++iz;
++      }
++      iz += step_z;
+     }
+   }
+ 
+@@ -110,19 +138,38 @@ dense_grid_reduce_block_atomic_kernel_t(Span span,
+   using BlockReduceT = gpucub::BlockReduce<T, BlockThreads>;
+   __shared__ typename BlockReduceT::TempStorage temp_storage;
+ 
+-  const int64_t flat =
++  const int64_t start =
+       static_cast<int64_t>(blockIdx.x) * BlockThreads + static_cast<int64_t>(threadIdx.x);
++  const int64_t stride =
++      static_cast<int64_t>(gridDim.x) * static_cast<int64_t>(BlockThreads);
+ 
+   T thread_val = init;
+-  if (flat < total_cells) {
++  if (start < total_cells) {
+     const ::carbon::int64_3d ext = span.iter_extent(view);
+-    const int64_t ix = flat % ext.x;
+-    const int64_t rest = flat / ext.x;
+-    const int64_t iy = rest % ext.y;
+-    const int64_t iz = rest / ext.y;
+-    const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
+-    if (vi.valid) {
+-      thread_val = fn(span, vi.idx);
++    int64_t ix = start % ext.x;
++    int64_t rest = start / ext.x;
++    int64_t iy = rest % ext.y;
++    int64_t iz = rest / ext.y;
++    const int64_t step_x = stride % ext.x;
++    const int64_t step_yz = stride / ext.x;
++    const int64_t step_y = step_yz % ext.y;
++    const int64_t step_z = step_yz / ext.y;
++    for (int64_t flat = start; flat < total_cells; flat += stride) {
++      const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
++      if (vi.valid) {
++        thread_val = op(thread_val, fn(span, vi.idx));
++      }
++      ix += step_x;
++      if (ix >= ext.x) {
++        ix -= ext.x;
++        ++iy;
++      }
++      iy += step_y;
++      if (iy >= ext.y) {
++        iy -= ext.y;
++        ++iz;
++      }
++      iz += step_z;
+     }
+   }
+ 
+diff --git a/include/carbon/detail/backend/cudalike/reduce_combine.h b/include/carbon/detail/backend/cudalike/reduce_combine.h
+index 0f14247..3b6c180 100644
+--- a/include/carbon/detail/backend/cudalike/reduce_combine.h
++++ b/include/carbon/detail/backend/cudalike/reduce_combine.h
+@@ -10,13 +10,17 @@
+  * ( @c ReductionResult::stage2_staging() , size @c gpu_count , on the root GPU); each
+  * per-GPU partial is peer-copied into its slot before the fold launches.
+  *
+- * Two helpers live here:
++ * Three helpers live here:
+  *
+  * - @ref combine_partials_kernel — the one-thread @c __global__ that walks the staging
+  *   buffer left-to-right, accumulating through @c Op . Callers always launch
+  *   @c <<<1, 1>>> ; the loop is sequential because @c gpu_count is 1–8 in practice and
+  *   serial @c Op is cheap relative to the peer copies that fed the buffer.
+  *
++ * - @ref combine_pair_kernel — the two-scalar fold used by the skeleton's
++ *   Partial Internal + Partial Boundary + Merge path; it reads the per-view finals
++ *   directly, so that path needs no staging buffer or D2D copies.
++ *
+  * - @ref sync_root_after_nonroot — fan-in cross-stream ordering: makes
+  *   @c stream[root] wait until every other per-GPU stream has reached the same point.
+  *   Carbon's public @c StreamGroup::wait_for is a per-i (zip) primitive, which doesn't
+@@ -81,6 +85,26 @@ combine_partials_kernel(const T* src,
+   }
+ }
+ 
++/**
++ * @brief Fold two scalars into @c *dst without staging them through a contiguous buffer.
++ *
++ * Used by the skeleton's Partial Internal + Partial Boundary + Merge path: the two
++ * per-view final scalars already live on the rank-local root GPU, so a direct pair
++ * kernel removes the two D2D copies that a staging-buffer fold would need.
++ */
++template <typename T,
++          typename Op>
++__global__ void
++combine_pair_kernel(const T* a,
++                    const T* b,
++                    T* dst,
++                    Op op,
++                    T init) {
++  if (blockIdx.x == 0U && threadIdx.x == 0U) {
++    *dst = op(op(init, *a), *b);
++  }
++}
++
+ /**
+  * @brief Host-side launcher for @ref combine_partials_kernel .
+  *
+@@ -119,6 +143,37 @@ launch_combine_partials(int device_id,
+   }
+ }
+ 
++/**
++ * @brief Host-side launcher for @ref combine_pair_kernel .
++ *
++ * Always issues @c <<<1, 1, 0, stream>>> on @p device_id . Sets the current device first,
++ * for the same reason as @ref launch_combine_partials .
++ */
++template <typename T,
++          typename Op>
++inline auto
++launch_combine_pair(int device_id,
++                    gpu_stream_t stream,
++                    const T* a,
++                    const T* b,
++                    T* dst,
++                    Op op) -> void {
++  const gpu_error_t set_err = gpu_set_device(device_id);
++  if (set_err != gpu_success) {
++    ::carbon::log::throw_with_log<std::runtime_error>(
++        "launch_combine_pair: gpu_set_device({}) failed: {} (cudaError {})", device_id,
++        gpu_error_string(set_err), static_cast<int>(set_err));
++  }
++  combine_pair_kernel<T, Op><<<1, 1, 0, stream>>>(a, b, dst, op, op.identity());
++  const gpu_error_t err = gpu_get_last_error();
++  if (err != gpu_success) {
++    ::carbon::log::throw_with_log<std::runtime_error>(
++        "launch_combine_pair: combine_pair_kernel launch failed on device {}: {} "
++        "(cudaError {})",
++        device_id, gpu_error_string(err), static_cast<int>(err));
++  }
++}
++
+ #endif  // CARBON_CUDALIKE_DEVICE_TU
+ 
+ #if CARBON_BACKEND_IS_CUDALIKE
+diff --git a/include/carbon/detail/backend/sycl/dense_distributed_reduce_kernel.h b/include/carbon/detail/backend/sycl/dense_distributed_reduce_kernel.h
+index 8dbbd2d..b67ed52 100644
+--- a/include/carbon/detail/backend/sycl/dense_distributed_reduce_kernel.h
++++ b/include/carbon/detail/backend/sycl/dense_distributed_reduce_kernel.h
+@@ -53,6 +53,9 @@ concept dense_reduce_fn = std::is_invocable_r_v<T, F, Span, Idx>;
+  */
+ constexpr int kReduceBlockThreads = 256;
+ 
++/** CUDA twin caps stage-1 blocks at this value; keep the published block_count symmetric. */
++constexpr int kReduceMaxStage1Blocks = 512;
++
+ /**
+  * @brief Launch a fused map+reduce over @c span 's iteration extent for @p view and
+  *        write the final scalar into @p out .
+diff --git a/include/carbon/detail/backend/sycl/reduce_combine.h b/include/carbon/detail/backend/sycl/reduce_combine.h
+index 63a3c5b..c848ca5 100644
+--- a/include/carbon/detail/backend/sycl/reduce_combine.h
++++ b/include/carbon/detail/backend/sycl/reduce_combine.h
+@@ -10,6 +10,9 @@
+  *   CUDA backend's degenerate path; the caller already wrote the identity into the
+  *   per-view final via @c queue.fill ).
+  *
++ * - @ref launch_combine_pair — folds the two per-view finals of the skeleton's
++ *   Partial Internal + Partial Boundary + Merge path directly, with no staging buffer.
++ *
+  * - @ref sync_root_after_nonroot — fan-in cross-stream ordering. Records a barrier
+  *   @c sycl::event on each non-root per-GPU queue (via
+  *   @c AdaptiveCpp_enqueue_custom_operation that captures the queue's frontier) and
+@@ -65,6 +68,27 @@ launch_combine_partials(sycl::queue& queue,
+   }
+ }
+ 
++template <typename T,
++          typename Op>
++inline auto
++launch_combine_pair(sycl::queue& queue,
++                    const T* a,
++                    const T* b,
++                    T* dst,
++                    Op op) -> void {
++  const T init = op.identity();
++  try {
++    queue.submit([&](sycl::handler& cgh) {
++      cgh.single_task([=]() {
++        *dst = op(op(init, *a), *b);
++      });
++    });
++  } catch (const sycl::exception& ex) {
++    ::carbon::log::throw_with_log<std::runtime_error>(
++        "launch_combine_pair: SYCL submission failed: {}", ex.what());
++  }
++}
++
+ inline auto
+ sync_root_after_nonroot([[maybe_unused]] const ::carbon::System& sys,
+                         const ::carbon::Stream& streams,
+diff --git a/include/carbon/detail/dense_distributed/span.h b/include/carbon/detail/dense_distributed/span.h
+index ec730ed..14119ad 100644
+--- a/include/carbon/detail/dense_distributed/span.h
++++ b/include/carbon/detail/dense_distributed/span.h
+@@ -26,6 +26,20 @@ using Idx = ::carbon::detail::dense::Idx;
+  */
+ using ValidatedIdx = ::carbon::detail::Validated<Idx>;
+ 
++/**
++ * The Boundary shell as six disjoint boxes over the owned extent. Per axis the low / high band
++ * thickness is clamped so the two never overlap (a chunk thinner than @c 2 * halo is shell
++ * entirely and @c Internal is empty). Box order: Z-low, Z-high (full XY); Y-low, Y-high
++ * (full X, middle Z); X-low, X-high (middle Y, middle Z).
++ */
++struct ShellBands {
++  int64_3d lo{};
++  int64_3d hi{};
++  int64_t vol[6]{};
++  int64_t prefix[7]{};
++  int64_t total{0};
++};
++
+ /**
+  * Layout of one GPU's dense subvolume expressed in @b storage (haloed) terms: per-axis haloed
+  * extent, elements per XY plane (pitch in elements), global coordinate where the chunk's storage
+@@ -62,6 +76,7 @@ class Span {
+   bool legacy_slab_{false};
+   float32_3d origin_{};
+   float spacing_{1.0F};
++  ShellBands shell_bands_cache_{};
+ 
+ public:
+   CARBON_HD constexpr Span() noexcept = default;
+@@ -91,7 +106,8 @@ public:
+         boundary_mode_(boundary_mode),
+         legacy_slab_(legacy_slab),
+         origin_(origin),
+-        spacing_(spacing) {}
++        spacing_(spacing),
++        shell_bands_cache_(make_shell_bands_(haloed_extent, halo)) {}
+ 
+   /**
+    * Construct a span over its @b storage (haloed) extent.
+@@ -409,30 +425,19 @@ private:
+   /** Row width of the 2-D Boundary launch box (two full 64-wide blocks per row). */
+   static constexpr int64_t kShellRowWidth = 128;
+ 
+-  /**
+-   * The Boundary shell as six disjoint boxes over the owned extent. Per axis the low / high band
+-   * thickness is clamped so the two never overlap (a chunk thinner than @c 2 * halo is shell
+-   * entirely and @c Internal is empty). Box order: Z-low, Z-high (full XY); Y-low, Y-high
+-   * (full X, middle Z); X-low, X-high (middle Y, middle Z).
+-   */
+-  struct ShellBands {
+-    int64_3d lo{};
+-    int64_3d hi{};
+-    int64_t vol[6]{};
+-    int64_t total{0};
+-  };
+-
+-  [[nodiscard]] CARBON_HD constexpr auto
+-  shell_bands_() const noexcept -> ShellBands {
+-    const int64_3d n = logic_extent();
++  [[nodiscard]] static CARBON_HD constexpr auto
++  make_shell_bands_(int64_3d haloed_extent,
++                    int64_3d halo) noexcept -> ShellBands {
++    const int64_3d n{haloed_extent.x - 2 * halo.x, haloed_extent.y - 2 * halo.y,
++                     haloed_extent.z - 2 * halo.z};
+     ShellBands b;
+-    b.lo = int64_3d{halo_.x < n.x ? halo_.x : n.x, halo_.y < n.y ? halo_.y : n.y,
+-                    halo_.z < n.z ? halo_.z : n.z};
++    b.lo = int64_3d{halo.x < n.x ? halo.x : n.x, halo.y < n.y ? halo.y : n.y,
++                    halo.z < n.z ? halo.z : n.z};
+     const int64_t rx = n.x - b.lo.x;
+     const int64_t ry = n.y - b.lo.y;
+     const int64_t rz = n.z - b.lo.z;
+-    b.hi = int64_3d{halo_.x < rx ? halo_.x : rx, halo_.y < ry ? halo_.y : ry,
+-                    halo_.z < rz ? halo_.z : rz};
++    b.hi = int64_3d{halo.x < rx ? halo.x : rx, halo.y < ry ? halo.y : ry,
++                    halo.z < rz ? halo.z : rz};
+     const int64_t mz = n.z - b.lo.z - b.hi.z;  // middle extents (>= 0 by the clamps)
+     const int64_t my = n.y - b.lo.y - b.hi.y;
+     b.vol[0] = n.x * n.y * b.lo.z;
+@@ -441,20 +446,29 @@ private:
+     b.vol[3] = n.x * b.hi.y * mz;
+     b.vol[4] = b.lo.x * my * mz;
+     b.vol[5] = b.hi.x * my * mz;
+-    b.total = b.vol[0] + b.vol[1] + b.vol[2] + b.vol[3] + b.vol[4] + b.vol[5];
++    b.prefix[0] = 0;
++    for (int i = 0; i < 6; ++i) {
++      b.prefix[i + 1] = b.prefix[i] + b.vol[i];
++    }
++    b.total = b.prefix[6];
+     return b;
+   }
+ 
++  [[nodiscard]] CARBON_HD constexpr auto
++  shell_bands_() const noexcept -> const ShellBands& {
++    return shell_bands_cache_;
++  }
++
+   /** Owned-local cell of linear shell index @p t in [0, bands.total); x varies fastest. */
+   [[nodiscard]] CARBON_HD constexpr auto
+   shell_cell_(const ShellBands& b,
+               int64_t t) const noexcept -> int64_3d {
+     const int64_3d n = logic_extent();
+     int box = 0;
+-    while (box < 5 && t >= b.vol[box]) {
+-      t -= b.vol[box];
++    while (box < 5 && t >= b.prefix[box + 1]) {
+       ++box;
+     }
++    t -= b.prefix[box];
+     int64_t bx = 0;  // box origin
+     int64_t by = 0;
+     int64_t bz = 0;
+@@ -547,7 +561,7 @@ Span::set_and_validate(::carbon::DataView view,
+ 
+       // Compact shell: thread (ix, iy) is the linear shell index t (iz is 0 by the range check
+       // above); the padded tail of the last row is invalid.
+-      const ShellBands bands = shell_bands_();
++      const ShellBands& bands = shell_bands_();
+       const int64_t t = iy * ext.x + ix;
+       if (t >= bands.total) {
+         return ValidatedIdx{Idx{}, false};
+diff --git a/include/carbon/detail/launch_traits.h b/include/carbon/detail/launch_traits.h
+index a5dca73..df07950 100644
+--- a/include/carbon/detail/launch_traits.h
++++ b/include/carbon/detail/launch_traits.h
+@@ -434,8 +434,11 @@ struct HostLaunchTraits<::carbon::Block<SBlock>> {
+  * - @c stage1_unit_count(grid, g_idx, view) — number of CUDA blocks the
+  *   stage-1 launch dispatches for @p view on local GPU @p g_idx . Dense /
+  *   DenseDisg 1-D : @c ceil_div(iter_extent.volume(), stage1_block_threads()) .
+- *   Dense / DenseDisg 2-D : @c ceil(ext.x / bx) * ceil((ext.y * ext.z) / by) .
+- *   Block : @c iter_block_count(view) (one CUDA block per retained brick).
++ *   DenseDistributed 1-D : the same count capped at
++ *   @c dense_distributed::kReduceMaxStage1Blocks (the kernel grid-strides).
++ *   Dense / DenseDisg / DenseDistributed 2-D : @c ceil(ext.x / bx) *
++ *   ceil((ext.y * ext.z) / by) . Block : @c iter_block_count(view) (one CUDA
++ *   block per retained brick).
+  * - @c is_empty_domain(grid, g_idx, view) — true iff the stage-1 launch
+  *   would have zero work. Dense / DenseDisg : @c iter_cells == 0 . Block :
+  *   @c iter_block_count(view) == 0 .
+@@ -493,7 +496,13 @@ struct ReduceLaunchTraits {
+         bt = dense_stage1_threads;
+       }
+     }
+-    return cells == 0 ? 0 : static_cast<int64_t>((cells + bt - 1) / bt);
++    const int64_t units = cells == 0 ? 0 : static_cast<int64_t>((cells + bt - 1) / bt);
++    if constexpr (requires { typename Grid::DenseDistributedPolicy; }) {
++      return units > ::carbon::detail::dense_distributed::kReduceMaxStage1Blocks
++                 ? ::carbon::detail::dense_distributed::kReduceMaxStage1Blocks
++                 : units;
++    }
++    return units;
+   }
+ 
+   static auto
+diff --git a/include/carbon/detail/reduce_kernel_impl.h b/include/carbon/detail/reduce_kernel_impl.h
+index e86dd64..978337d 100644
+--- a/include/carbon/detail/reduce_kernel_impl.h
++++ b/include/carbon/detail/reduce_kernel_impl.h
+@@ -278,10 +278,6 @@ public:
+             cub_temp_bytes_[g_idx], /*relative_gpu_id=*/static_cast<int>(g_idx));
+       }
+     }
+-    {
+-      const detail::Gpu& root = grid_.system().gpu_group().devices()[0U];
+-      merge_pair_scratch_ = root.template buffer<T>(2U, /*relative_gpu_id=*/0);
+-    }
+ #elif CARBON_BACKEND_IS_SYCL
+     // SYCL: nothing to allocate up front — sycl::reduction owns its own per-work-group
+     // scratch. The per-GPU total/block counts above are still computed for parity with
+@@ -593,20 +589,14 @@ public:
+       log::throw_with_log<std::runtime_error>(
+           "Kernel::reduce::launch_merge: gpu_set_device failed");
+     }
+-    // Merge runs after both Partials; reuse Standard stage-2 staging (gpu_count>=2) or
+-    // the dedicated 2-element scratch (single-GPU).
+-    T* staging = dst.gpu_count() > 1U ? dst.stage2_staging(DataView::Standard).data()
+-                                      : merge_pair_scratch_.data();
++    // Merge runs after both Partials. Fold the two per-view scalars directly so the
++    // merge costs one kernel launch instead of two D2D copies plus a staged fold.
+     T* const out = dst.device_data(DataView::Standard);
+     const T* const internal = dst.device_data(DataView::Internal);
+     const T* const boundary = dst.device_data(DataView::Boundary);
+     const gpu_stream_t cuda_stream = stream[static_cast<size_t>(root_gpu_idx)].get();
+-    const gpu_error_t c0 = gpu_memcpy_async_default(staging, internal, sizeof(T), cuda_stream);
+-    const gpu_error_t c1 = gpu_memcpy_async_default(staging + 1, boundary, sizeof(T), cuda_stream);
+-    if (c0 != gpu_success || c1 != gpu_success) {
+-      log::throw_with_log<std::runtime_error>("Kernel::reduce::launch_merge: D2D copy failed");
+-    }
+-    dense::launch_combine_partials<T, Op>(root_gpu.device_id(), cuda_stream, staging, out, 2, op_);
++    dense::launch_combine_pair<T, Op>(root_gpu.device_id(), cuda_stream, internal, boundary, out,
++                                      op_);
+     reduce_stages::run_stage3_cross_rank<T, Op>(grid_.system(), stream, dst, DataView::Standard);
+     if (reduce_options_.host_copy == reduce::ReduceHostCopy::Inline) {
+       const size_t slot = dst.active_slot();
+@@ -629,20 +619,7 @@ public:
+     T* const out = dst.device_data(DataView::Standard);
+     const T* const internal = dst.device_data(DataView::Internal);
+     const T* const boundary = dst.device_data(DataView::Boundary);
+-    // Copy Op and the identity into locals so the device lambda captures no `this`
+-    // pointer; the single_task folds the two already-combined Partial scalars.
+-    const Op op = op_;
+-    const T init = op.identity();
+-    try {
+-      q.submit([&](sycl::handler& cgh) {
+-        cgh.single_task([op, init, out, internal, boundary]() {
+-          *out = op(op(init, *internal), *boundary);
+-        });
+-      });
+-    } catch (const sycl::exception& ex) {
+-      log::throw_with_log<std::runtime_error>(
+-          "Kernel::reduce::launch_merge: SYCL submission failed: {}", ex.what());
+-    }
++    dense::launch_combine_pair<T, Op>(q, internal, boundary, out, op_);
+ 
+     reduce_stages::run_stage3_cross_rank<T, Op>(grid_.system(), stream, dst,
+                                                 DataView::Standard);
+@@ -677,7 +654,8 @@ public:
+ 
+   /**
+    * Number of CUDA blocks launched by stage 1 for the @c Standard view, summed across
+-   * local GPUs (matches the legacy single-GPU contract — see @ref total_cells ).
++   * local GPUs. DenseDistributed 1-D launches are capped at
++   * @c dense_distributed::kReduceMaxStage1Blocks because their kernel grid-strides.
+    */
+   [[nodiscard]] auto
+   block_count() const noexcept -> int64_t {
+@@ -730,7 +708,6 @@ private:
+ #if CARBON_BACKEND_IS_CUDALIKE && CARBON_CUDALIKE_DEVICE_TU
+   /** Per-view per-GPU stage-1 block partials (concurrent Partial I/B safe). */
+   std::array<std::vector<detail::Allocation<T>>, ReductionResult<T>::kViewCount> partials_{};
+-  detail::Allocation<T> merge_pair_scratch_{};
+   std::vector<size_t> cub_temp_bytes_{};
+   std::array<std::vector<detail::Allocation<std::byte>>, ReductionResult<T>::kViewCount>
+       cub_temp_storage_{};

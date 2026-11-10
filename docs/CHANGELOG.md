@@ -6265,3 +6265,14 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   (D3Q19/D3Q27) and `Standard` semantics (which copy full boundary planes, corners included)
   keep the staged passes. The host test now drives the batched gather/scatter, checks the
   over-limit fallback, and compares a fused D3Q7 exchange against the staged oracle.
+
+- **2026-11 — §3.7 reduction launch and index-math overhead reduced.** `DenseDistributed`
+  stage-1 CUDA reductions now launch a capped grid-stride grid (`kReduceMaxStage1Blocks`, 512)
+  instead of one block per 256 cells, so production domains write hundreds of partials rather
+  than tens of thousands. The loop carries `(ix, iy, iz)` forward with precomputed per-stride
+  increments, avoiding the four 64-bit div/mod decode per cell. `Span` caches the six-box
+  Boundary shell and its prefix sums at construction, so `iter_extent(Boundary)` and
+  `set_and_validate(Boundary)` no longer rebuild the band geometry per thread. The skeleton's
+  Internal + Boundary + Merge path now folds the two per-view scalars with a direct pair
+  kernel, dropping two D2D staging copies per merge on CUDA/HIP (and using the matching SYCL
+  helper).

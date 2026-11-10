@@ -10,12 +10,16 @@
  * ( @c ReductionResult::stage2_staging() , size @c gpu_count , on the root GPU); each
  * per-GPU partial is peer-copied into its slot before the fold launches.
  *
- * Two helpers live here:
+ * Three helpers live here:
  *
  * - @ref combine_partials_kernel — the one-thread @c __global__ that walks the staging
  *   buffer left-to-right, accumulating through @c Op . Callers always launch
  *   @c <<<1, 1>>> ; the loop is sequential because @c gpu_count is 1–8 in practice and
  *   serial @c Op is cheap relative to the peer copies that fed the buffer.
+ *
+ * - @ref combine_pair_kernel — the two-scalar fold used by the skeleton's
+ *   Partial Internal + Partial Boundary + Merge path; it reads the per-view finals
+ *   directly, so that path needs no staging buffer or D2D copies.
  *
  * - @ref sync_root_after_nonroot — fan-in cross-stream ordering: makes
  *   @c stream[root] wait until every other per-GPU stream has reached the same point.
@@ -82,6 +86,26 @@ combine_partials_kernel(const T* src,
 }
 
 /**
+ * @brief Fold two scalars into @c *dst without staging them through a contiguous buffer.
+ *
+ * Used by the skeleton's Partial Internal + Partial Boundary + Merge path: the two
+ * per-view final scalars already live on the rank-local root GPU, so a direct pair
+ * kernel removes the two D2D copies that a staging-buffer fold would need.
+ */
+template <typename T,
+          typename Op>
+__global__ void
+combine_pair_kernel(const T* a,
+                    const T* b,
+                    T* dst,
+                    Op op,
+                    T init) {
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    *dst = op(op(init, *a), *b);
+  }
+}
+
+/**
  * @brief Host-side launcher for @ref combine_partials_kernel .
  *
  * Always issues @c <<<1, 1, 0, stream>>> on @p device_id . Sets the current CUDA device
@@ -114,6 +138,37 @@ launch_combine_partials(int device_id,
   if (err != gpu_success) {
     ::carbon::log::throw_with_log<std::runtime_error>(
         "launch_combine_partials: combine_partials_kernel launch failed on device {}: {} "
+        "(cudaError {})",
+        device_id, gpu_error_string(err), static_cast<int>(err));
+  }
+}
+
+/**
+ * @brief Host-side launcher for @ref combine_pair_kernel .
+ *
+ * Always issues @c <<<1, 1, 0, stream>>> on @p device_id . Sets the current device first,
+ * for the same reason as @ref launch_combine_partials .
+ */
+template <typename T,
+          typename Op>
+inline auto
+launch_combine_pair(int device_id,
+                    gpu_stream_t stream,
+                    const T* a,
+                    const T* b,
+                    T* dst,
+                    Op op) -> void {
+  const gpu_error_t set_err = gpu_set_device(device_id);
+  if (set_err != gpu_success) {
+    ::carbon::log::throw_with_log<std::runtime_error>(
+        "launch_combine_pair: gpu_set_device({}) failed: {} (cudaError {})", device_id,
+        gpu_error_string(set_err), static_cast<int>(set_err));
+  }
+  combine_pair_kernel<T, Op><<<1, 1, 0, stream>>>(a, b, dst, op, op.identity());
+  const gpu_error_t err = gpu_get_last_error();
+  if (err != gpu_success) {
+    ::carbon::log::throw_with_log<std::runtime_error>(
+        "launch_combine_pair: combine_pair_kernel launch failed on device {}: {} "
         "(cudaError {})",
         device_id, gpu_error_string(err), static_cast<int>(err));
   }

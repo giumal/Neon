@@ -434,8 +434,11 @@ struct HostLaunchTraits<::carbon::Block<SBlock>> {
  * - @c stage1_unit_count(grid, g_idx, view) — number of CUDA blocks the
  *   stage-1 launch dispatches for @p view on local GPU @p g_idx . Dense /
  *   DenseDisg 1-D : @c ceil_div(iter_extent.volume(), stage1_block_threads()) .
- *   Dense / DenseDisg 2-D : @c ceil(ext.x / bx) * ceil((ext.y * ext.z) / by) .
- *   Block : @c iter_block_count(view) (one CUDA block per retained brick).
+ *   DenseDistributed 1-D : the same count capped at
+ *   @c dense_distributed::kReduceMaxStage1Blocks (the kernel grid-strides).
+ *   Dense / DenseDisg / DenseDistributed 2-D : @c ceil(ext.x / bx) *
+ *   ceil((ext.y * ext.z) / by) . Block : @c iter_block_count(view) (one CUDA
+ *   block per retained brick).
  * - @c is_empty_domain(grid, g_idx, view) — true iff the stage-1 launch
  *   would have zero work. Dense / DenseDisg : @c iter_cells == 0 . Block :
  *   @c iter_block_count(view) == 0 .
@@ -493,7 +496,13 @@ struct ReduceLaunchTraits {
         bt = dense_stage1_threads;
       }
     }
-    return cells == 0 ? 0 : static_cast<int64_t>((cells + bt - 1) / bt);
+    const int64_t units = cells == 0 ? 0 : static_cast<int64_t>((cells + bt - 1) / bt);
+    if constexpr (requires { typename Grid::DenseDistributedPolicy; }) {
+      return units > ::carbon::detail::dense_distributed::kReduceMaxStage1Blocks
+                 ? ::carbon::detail::dense_distributed::kReduceMaxStage1Blocks
+                 : units;
+    }
+    return units;
   }
 
   static auto

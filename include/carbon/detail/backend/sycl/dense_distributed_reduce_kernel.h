@@ -53,6 +53,9 @@ concept dense_reduce_fn = std::is_invocable_r_v<T, F, Span, Idx>;
  */
 constexpr int kReduceBlockThreads = 256;
 
+/** CUDA twin caps stage-1 blocks at this value; keep the published block_count symmetric. */
+constexpr int kReduceMaxStage1Blocks = 512;
+
 /**
  * @brief Launch a fused map+reduce over @c span 's iteration extent for @p view and
  *        write the final scalar into @p out .

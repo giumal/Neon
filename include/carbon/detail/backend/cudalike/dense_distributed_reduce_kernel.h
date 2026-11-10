@@ -48,6 +48,15 @@ concept dense_reduce_fn = std::is_invocable_r_v<T, F, Span, Idx>;
  */
 constexpr int kReduceBlockThreads = 256;
 
+/**
+ * Upper bound on stage-1 CUDA blocks per GPU. A flat launch would otherwise emit one
+ * block per @c kReduceBlockThreads cells (tens of thousands on production domains), and
+ * every block writes one partial that CUB then folds. A capped grid-stride launch keeps
+ * the same coverage with at most this many partials, which is enough to fill current
+ * GPUs while making stage 1.5 a tiny reduction instead of a large one.
+ */
+constexpr int kReduceMaxStage1Blocks = 512;
+
 #if CARBON_CUDALIKE_DEVICE_TU
 
 /**
@@ -69,19 +78,38 @@ dense_grid_reduce_kernel_t(Span span,
   using BlockReduceT = gpucub::BlockReduce<T, BlockThreads>;
   __shared__ typename BlockReduceT::TempStorage temp_storage;
 
-  const int64_t flat =
+  const int64_t start =
       static_cast<int64_t>(blockIdx.x) * BlockThreads + static_cast<int64_t>(threadIdx.x);
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * static_cast<int64_t>(BlockThreads);
 
   T thread_val = init;
-  if (flat < total_cells) {
+  if (start < total_cells) {
     const ::carbon::int64_3d ext = span.iter_extent(view);
-    const int64_t ix = flat % ext.x;
-    const int64_t rest = flat / ext.x;
-    const int64_t iy = rest % ext.y;
-    const int64_t iz = rest / ext.y;
-    const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
-    if (vi.valid) {
-      thread_val = fn(span, vi.idx);
+    int64_t ix = start % ext.x;
+    int64_t rest = start / ext.x;
+    int64_t iy = rest % ext.y;
+    int64_t iz = rest / ext.y;
+    const int64_t step_x = stride % ext.x;
+    const int64_t step_yz = stride / ext.x;
+    const int64_t step_y = step_yz % ext.y;
+    const int64_t step_z = step_yz / ext.y;
+    for (int64_t flat = start; flat < total_cells; flat += stride) {
+      const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
+      if (vi.valid) {
+        thread_val = op(thread_val, fn(span, vi.idx));
+      }
+      ix += step_x;
+      if (ix >= ext.x) {
+        ix -= ext.x;
+        ++iy;
+      }
+      iy += step_y;
+      if (iy >= ext.y) {
+        iy -= ext.y;
+        ++iz;
+      }
+      iz += step_z;
     }
   }
 
@@ -110,19 +138,38 @@ dense_grid_reduce_block_atomic_kernel_t(Span span,
   using BlockReduceT = gpucub::BlockReduce<T, BlockThreads>;
   __shared__ typename BlockReduceT::TempStorage temp_storage;
 
-  const int64_t flat =
+  const int64_t start =
       static_cast<int64_t>(blockIdx.x) * BlockThreads + static_cast<int64_t>(threadIdx.x);
+  const int64_t stride =
+      static_cast<int64_t>(gridDim.x) * static_cast<int64_t>(BlockThreads);
 
   T thread_val = init;
-  if (flat < total_cells) {
+  if (start < total_cells) {
     const ::carbon::int64_3d ext = span.iter_extent(view);
-    const int64_t ix = flat % ext.x;
-    const int64_t rest = flat / ext.x;
-    const int64_t iy = rest % ext.y;
-    const int64_t iz = rest / ext.y;
-    const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
-    if (vi.valid) {
-      thread_val = fn(span, vi.idx);
+    int64_t ix = start % ext.x;
+    int64_t rest = start / ext.x;
+    int64_t iy = rest % ext.y;
+    int64_t iz = rest / ext.y;
+    const int64_t step_x = stride % ext.x;
+    const int64_t step_yz = stride / ext.x;
+    const int64_t step_y = step_yz % ext.y;
+    const int64_t step_z = step_yz / ext.y;
+    for (int64_t flat = start; flat < total_cells; flat += stride) {
+      const ValidatedIdx vi = span.set_and_validate(view, ix, iy, iz);
+      if (vi.valid) {
+        thread_val = op(thread_val, fn(span, vi.idx));
+      }
+      ix += step_x;
+      if (ix >= ext.x) {
+        ix -= ext.x;
+        ++iy;
+      }
+      iy += step_y;
+      if (iy >= ext.y) {
+        iy -= ext.y;
+        ++iz;
+      }
+      iz += step_z;
     }
   }
 

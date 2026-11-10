@@ -27,6 +27,20 @@ using Idx = ::carbon::detail::dense::Idx;
 using ValidatedIdx = ::carbon::detail::Validated<Idx>;
 
 /**
+ * The Boundary shell as six disjoint boxes over the owned extent. Per axis the low / high band
+ * thickness is clamped so the two never overlap (a chunk thinner than @c 2 * halo is shell
+ * entirely and @c Internal is empty). Box order: Z-low, Z-high (full XY); Y-low, Y-high
+ * (full X, middle Z); X-low, X-high (middle Y, middle Z).
+ */
+struct ShellBands {
+  int64_3d lo{};
+  int64_3d hi{};
+  int64_t vol[6]{};
+  int64_t prefix[7]{};
+  int64_t total{0};
+};
+
+/**
  * Layout of one GPU's dense subvolume expressed in @b storage (haloed) terms: per-axis haloed
  * extent, elements per XY plane (pitch in elements), global coordinate where the chunk's storage
  * starts, and the halo thickness on each axis.
@@ -62,6 +76,7 @@ class Span {
   bool legacy_slab_{false};
   float32_3d origin_{};
   float spacing_{1.0F};
+  ShellBands shell_bands_cache_{};
 
 public:
   CARBON_HD constexpr Span() noexcept = default;
@@ -91,7 +106,8 @@ public:
         boundary_mode_(boundary_mode),
         legacy_slab_(legacy_slab),
         origin_(origin),
-        spacing_(spacing) {}
+        spacing_(spacing),
+        shell_bands_cache_(make_shell_bands_(haloed_extent, halo)) {}
 
   /**
    * Construct a span over its @b storage (haloed) extent.
@@ -409,30 +425,19 @@ private:
   /** Row width of the 2-D Boundary launch box (two full 64-wide blocks per row). */
   static constexpr int64_t kShellRowWidth = 128;
 
-  /**
-   * The Boundary shell as six disjoint boxes over the owned extent. Per axis the low / high band
-   * thickness is clamped so the two never overlap (a chunk thinner than @c 2 * halo is shell
-   * entirely and @c Internal is empty). Box order: Z-low, Z-high (full XY); Y-low, Y-high
-   * (full X, middle Z); X-low, X-high (middle Y, middle Z).
-   */
-  struct ShellBands {
-    int64_3d lo{};
-    int64_3d hi{};
-    int64_t vol[6]{};
-    int64_t total{0};
-  };
-
-  [[nodiscard]] CARBON_HD constexpr auto
-  shell_bands_() const noexcept -> ShellBands {
-    const int64_3d n = logic_extent();
+  [[nodiscard]] static CARBON_HD constexpr auto
+  make_shell_bands_(int64_3d haloed_extent,
+                    int64_3d halo) noexcept -> ShellBands {
+    const int64_3d n{haloed_extent.x - 2 * halo.x, haloed_extent.y - 2 * halo.y,
+                     haloed_extent.z - 2 * halo.z};
     ShellBands b;
-    b.lo = int64_3d{halo_.x < n.x ? halo_.x : n.x, halo_.y < n.y ? halo_.y : n.y,
-                    halo_.z < n.z ? halo_.z : n.z};
+    b.lo = int64_3d{halo.x < n.x ? halo.x : n.x, halo.y < n.y ? halo.y : n.y,
+                    halo.z < n.z ? halo.z : n.z};
     const int64_t rx = n.x - b.lo.x;
     const int64_t ry = n.y - b.lo.y;
     const int64_t rz = n.z - b.lo.z;
-    b.hi = int64_3d{halo_.x < rx ? halo_.x : rx, halo_.y < ry ? halo_.y : ry,
-                    halo_.z < rz ? halo_.z : rz};
+    b.hi = int64_3d{halo.x < rx ? halo.x : rx, halo.y < ry ? halo.y : ry,
+                    halo.z < rz ? halo.z : rz};
     const int64_t mz = n.z - b.lo.z - b.hi.z;  // middle extents (>= 0 by the clamps)
     const int64_t my = n.y - b.lo.y - b.hi.y;
     b.vol[0] = n.x * n.y * b.lo.z;
@@ -441,8 +446,17 @@ private:
     b.vol[3] = n.x * b.hi.y * mz;
     b.vol[4] = b.lo.x * my * mz;
     b.vol[5] = b.hi.x * my * mz;
-    b.total = b.vol[0] + b.vol[1] + b.vol[2] + b.vol[3] + b.vol[4] + b.vol[5];
+    b.prefix[0] = 0;
+    for (int i = 0; i < 6; ++i) {
+      b.prefix[i + 1] = b.prefix[i] + b.vol[i];
+    }
+    b.total = b.prefix[6];
     return b;
+  }
+
+  [[nodiscard]] CARBON_HD constexpr auto
+  shell_bands_() const noexcept -> const ShellBands& {
+    return shell_bands_cache_;
   }
 
   /** Owned-local cell of linear shell index @p t in [0, bands.total); x varies fastest. */
@@ -451,10 +465,10 @@ private:
               int64_t t) const noexcept -> int64_3d {
     const int64_3d n = logic_extent();
     int box = 0;
-    while (box < 5 && t >= b.vol[box]) {
-      t -= b.vol[box];
+    while (box < 5 && t >= b.prefix[box + 1]) {
       ++box;
     }
+    t -= b.prefix[box];
     int64_t bx = 0;  // box origin
     int64_t by = 0;
     int64_t bz = 0;
@@ -547,7 +561,7 @@ Span::set_and_validate(::carbon::DataView view,
 
       // Compact shell: thread (ix, iy) is the linear shell index t (iz is 0 by the range check
       // above); the padded tail of the last row is invalid.
-      const ShellBands bands = shell_bands_();
+      const ShellBands& bands = shell_bands_();
       const int64_t t = iy * ext.x + ix;
       if (t >= bands.total) {
         return ValidatedIdx{Idx{}, false};

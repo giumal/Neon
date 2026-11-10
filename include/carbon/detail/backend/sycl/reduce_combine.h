@@ -10,6 +10,9 @@
  *   CUDA backend's degenerate path; the caller already wrote the identity into the
  *   per-view final via @c queue.fill ).
  *
+ * - @ref launch_combine_pair — folds the two per-view finals of the skeleton's
+ *   Partial Internal + Partial Boundary + Merge path directly, with no staging buffer.
+ *
  * - @ref sync_root_after_nonroot — fan-in cross-stream ordering. Records a barrier
  *   @c sycl::event on each non-root per-GPU queue (via
  *   @c AdaptiveCpp_enqueue_custom_operation that captures the queue's frontier) and
@@ -62,6 +65,27 @@ launch_combine_partials(sycl::queue& queue,
   } catch (const sycl::exception& ex) {
     ::carbon::log::throw_with_log<std::runtime_error>(
         "launch_combine_partials: SYCL submission failed: {}", ex.what());
+  }
+}
+
+template <typename T,
+          typename Op>
+inline auto
+launch_combine_pair(sycl::queue& queue,
+                    const T* a,
+                    const T* b,
+                    T* dst,
+                    Op op) -> void {
+  const T init = op.identity();
+  try {
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.single_task([=]() {
+        *dst = op(op(init, *a), *b);
+      });
+    });
+  } catch (const sycl::exception& ex) {
+    ::carbon::log::throw_with_log<std::runtime_error>(
+        "launch_combine_pair: SYCL submission failed: {}", ex.what());
   }
 }
 
