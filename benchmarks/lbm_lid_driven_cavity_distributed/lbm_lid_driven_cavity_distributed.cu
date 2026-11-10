@@ -125,6 +125,12 @@ struct Options {
   // family (Halo / HaloDisg / HaloDistributed).
   std::string grid = "dense";
   std::string decomposition = "slab";
+  // Process-grid factorization for dense_distributed:
+  //   legacy = ProcessGrid::make(world, mode) (pre-Patch-1 behavior)
+  //   extent = ProcessGrid::make(world, mode, global) (extent-aware)
+  std::string pg_mode = "legacy";
+  // Opt into DenseDistributed's padded row/component layout.
+  bool pad_rows = false;
   std::string report_path = "";
   std::string label = "";
   std::string vtk_path = "";
@@ -190,6 +196,11 @@ build_cli(Options& opts) -> clipp::group {
           "Process decomposition for --grid dense_distributed (default: slab). "
           "slab splits z; pencil splits y and z; brick splits all three axes. "
           "Auto-factorized across ranks; ignored for dense/disg, which are slab-only.",
+      (option("--pg-mode") & value("legacy|extent", opts.pg_mode)) %
+          "Process-grid factorization for dense_distributed: legacy (default) or "
+          "extent-aware (uses the global extents to minimise halo surface).",
+      option("--pad-rows").set(opts.pad_rows) %
+          "Enable DenseDistributed's opt-in padded row/component layout.",
       (option("-gpus", "--gpus") & integer("n", opts.n_gpus)) %
           "Use the first N visible CUDA devices (-1 = all visible; default -1). "
           "Combine with CUDA_VISIBLE_DEVICES to pick physical GPUs.",
@@ -286,6 +297,15 @@ parse_cli(int argc,
   if (opts.grid != "dense_distributed" && opts.decomposition != "slab") {
     std::cerr << "lbm_lid_driven_cavity: --decomposition " << opts.decomposition
               << " requires --grid dense_distributed (dense/disg are slab-only)\n";
+    return false;
+  }
+  if (opts.pg_mode != "legacy" && opts.pg_mode != "extent") {
+    std::cerr << "lbm_lid_driven_cavity: --pg-mode must be legacy or extent (got '"
+              << opts.pg_mode << "')\n";
+    return false;
+  }
+  if (opts.pad_rows && opts.grid != "dense_distributed") {
+    std::cerr << "lbm_lid_driven_cavity: --pad-rows requires --grid dense_distributed\n";
     return false;
   }
   if (opts.overlap != "none" && opts.overlap != "standard" && opts.overlap != "extended" &&
@@ -529,11 +549,17 @@ run_benchmark(const Options& opts,
   std::optional<carbon::ProcessGrid> pg;
   if constexpr (std::is_same_v<Grid, carbon::DenseDistributed>) {
     const int grid_world = use_mpi ? world_size : local_gpu_count;
-    pg.emplace(carbon::ProcessGrid::make(grid_world, dec_mode));
+    if (opts.pg_mode == "extent") {
+      pg.emplace(carbon::ProcessGrid::make(grid_world, dec_mode, global));
+    } else {
+      pg.emplace(carbon::ProcessGrid::make(grid_world, dec_mode));
+    }
     if (world_rank == 0) {
       const carbon::int32_3d dims = pg->dims();
-      CARBON_LOG_INFO("lbm_lid_driven_cavity: process_grid={}x{}x{} (world_size={})", dims.x,
-                      dims.y, dims.z, grid_world);
+      CARBON_LOG_INFO(
+          "lbm_lid_driven_cavity: process_grid={}x{}x{} (world_size={}, mode={}, "
+          "global_extent={}x{}x{})",
+          dims.x, dims.y, dims.z, grid_world, opts.pg_mode, global.x, global.y, global.z);
     }
   }
 
@@ -548,7 +574,11 @@ run_benchmark(const Options& opts,
     } else if constexpr (std::is_same_v<Grid, carbon::DenseDisg>) {
       return carbon::DenseDisg(sys, global, /*halo_z=*/1);
     } else {
-      return carbon::DenseDistributed(sys, global, *pg, stencil);
+      carbon::DenseDistributed::LayoutOptions layout{};
+      layout.pad_rows = opts.pad_rows;
+      return carbon::DenseDistributed(sys, global, *pg, stencil,
+                                      carbon::BoundaryModeDistributed::Open, {}, 1.0F,
+                                      std::nullopt, layout);
     }
   }();
 
@@ -927,7 +957,9 @@ run_benchmark(const Options& opts,
     out << "    \"lattice\": \"" << json_escape(lattice_name) << "\",\n";
     out << "    \"collision\": \"" << json_escape(collision_name) << "\",\n";
     out << "    \"grid\": \"" << json_escape(opts.grid) << "\",\n";
-    out << "    \"decomposition\": \"" << decomposition_mode_name(dec_mode) << "\",\n";
+    out << "    \"decomposition\": \"" << json_escape(decomposition_mode_name(dec_mode)) << "\",\n";
+    out << "    \"pg_mode\": \"" << json_escape(opts.pg_mode) << "\",\n";
+    out << "    \"pad_rows\": " << (opts.pad_rows ? "true" : "false") << ",\n";
     out << "    \"q\": " << Lattice::Q << ",\n";
     out << "    \"re\": " << opts.re << ",\n";
     out << "    \"ulb\": " << ulb << ",\n";

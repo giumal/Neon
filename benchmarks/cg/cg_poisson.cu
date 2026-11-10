@@ -220,6 +220,8 @@ struct Options {
   bool dump_dot = false;
   bool show_help = false;
   std::string dec;
+  std::string pg_mode = "legacy";
+  bool pad_rows = false;
   std::string dot_out_prefix;
   bool dot_matrix = false;
   std::string vtk_path = "";      // NEW
@@ -269,7 +271,12 @@ build_cli(Options& opts) -> clipp::group {
           "legacy STRUCTURED_POINTS file at PATH (appends .rankN under MPI; "
           "Dense and DenseDistributed only). Off by default.",
       (option("--decomposition") & value("mode", opts.dec)) %
-          "MPI decomposition: slab | pencil | brick (default: slab, only relevant for distributed runs)";
+          "MPI decomposition: slab | pencil | brick (default: slab, only relevant for distributed runs)",
+      (option("--pg-mode") & value("legacy|extent", opts.pg_mode)) %
+          "Process-grid factorization for dense_distributed: legacy (default) or "
+          "extent-aware (uses the global extents to minimise halo surface)",
+      option("--pad-rows").set(opts.pad_rows) %
+          "Enable DenseDistributed's opt-in padded row/component layout";
 
 }
 
@@ -300,6 +307,15 @@ parse_cli(int argc,
   }
   if (opts.warmup > opts.max_iter) {
     opts.warmup = opts.max_iter;
+  }
+  if (opts.pg_mode != "legacy" && opts.pg_mode != "extent") {
+    std::cerr << "cg_poisson_unified: --pg-mode must be legacy or extent (got '" << opts.pg_mode
+              << "')\n";
+    return false;
+  }
+  if (opts.pad_rows && opts.grid_kind != "dense_distributed") {
+    std::cerr << "cg_poisson_unified: --pad-rows requires --grid dense_distributed\n";
+    return false;
   }
   return true;
 }
@@ -1076,7 +1092,7 @@ main(int argc, char** argv) -> int {
     CARBON_LOG_INFO(
         "cg_poisson_unified: grid={} nx={} ny={} nz={} max_iter={} tol_rel={:.1e} tol_abs={:.1e} "
         "bd_min={:+.3f} bd_max={:+.3f} backend={} gpus_local={} world_size={} distributed={} "
-        "decomposition={}",
+        "decomposition={} pg_mode={} pad_rows={}",
         opts.grid_kind, opts.nx, opts.ny, opts.nz, opts.max_iter, opts.tol_rel, opts.tol_abs,
         opts.bd_min, opts.bd_max,
 #if CARBON_BACKEND_IS_SYCL
@@ -1085,7 +1101,7 @@ main(int argc, char** argv) -> int {
         "CUDA",
 #endif
         sys.gpu_group().size(), world_size, is_distributed,
-        is_distributed ? decomposition_mode_name(dec_mode) : "n/a");
+        is_distributed ? decomposition_mode_name(dec_mode) : "n/a", opts.pg_mode, opts.pad_rows);
   }
 
   const carbon::int64_3d global{opts.nx, opts.ny, opts.nz};
@@ -1098,11 +1114,17 @@ main(int argc, char** argv) -> int {
   // and splits z across ranks by itself, so it never takes a process grid.
   std::optional<carbon::ProcessGrid> pg;
   if (is_distributed && opts.grid_kind == "dense_distributed") {
-    pg.emplace(carbon::ProcessGrid::make(world_size, dec_mode));
+    if (opts.pg_mode == "extent") {
+      pg.emplace(carbon::ProcessGrid::make(world_size, dec_mode, global));
+    } else {
+      pg.emplace(carbon::ProcessGrid::make(world_size, dec_mode));
+    }
     const carbon::int32_3d dims = pg->dims();
     if (world_rank == 0) {
-      CARBON_LOG_INFO("cg_poisson_unified: process_grid={}x{}x{} (world_size={})", dims.x, dims.y,
-                      dims.z, world_size);
+      CARBON_LOG_INFO(
+          "cg_poisson_unified: process_grid={}x{}x{} (world_size={}, mode={}, "
+          "global_extent={}x{}x{})",
+          dims.x, dims.y, dims.z, world_size, opts.pg_mode, global.x, global.y, global.z);
     }
   }
 
@@ -1125,10 +1147,16 @@ main(int argc, char** argv) -> int {
     }
     if (opts.grid_kind == "dense_distributed") {
       std::optional<carbon::DenseDistributed> dense_distributed;
+      carbon::DenseDistributed::LayoutOptions layout{};
+      layout.pad_rows = opts.pad_rows;
       if (pg) {
-        dense_distributed.emplace(sys, global, *pg, stencil);
+        dense_distributed.emplace(sys, global, *pg, stencil,
+                                  carbon::BoundaryModeDistributed::Open, carbon::float32_3d{}, 1.0F,
+                                  std::optional<carbon::LaunchShape>{}, layout);
       } else {
-        dense_distributed.emplace(sys, global, stencil);
+        dense_distributed.emplace(sys, global, stencil,
+                                  carbon::BoundaryModeDistributed::Open, carbon::float32_3d{}, 1.0F,
+                                  std::optional<carbon::LaunchShape>{}, layout);
       }
       return run_cg(*dense_distributed, sys, opts, "dense_distributed", world_rank);
     }
