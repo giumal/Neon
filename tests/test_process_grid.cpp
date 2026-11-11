@@ -8,6 +8,7 @@ namespace {
 
 using carbon::DecompositionMode;
 using carbon::int32_3d;
+using carbon::int64_3d;
 using carbon::ProcessGrid;
 
 template <typename Fn>
@@ -103,7 +104,7 @@ test_brick() {
 
 void
 test_extent_aware() {
-  const int32_3d cube{256, 256, 256};
+  const int64_3d cube{256, 256, 256};
 
   const ProcessGrid eight = ProcessGrid::make(8, DecompositionMode::Brick, cube);
   assert(eight.dims() == (int32_3d{1, 2, 4}));
@@ -123,7 +124,7 @@ test_extent_aware() {
   expect_round_trip(pencil);
 
   const ProcessGrid fallback =
-      ProcessGrid::make(8, DecompositionMode::Brick, int32_3d{0, 0, 0});
+      ProcessGrid::make(8, DecompositionMode::Brick, int64_3d{0, 0, 0});
   assert(fallback.dims() == (int32_3d{2, 2, 2}));
   expect_round_trip(fallback);
 }
@@ -156,7 +157,7 @@ test_invalid() {
   expect_invalid_argument(
       [] { static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom)); });
   expect_invalid_argument([] {
-    static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom, int32_3d{8, 8, 8}));
+    static_cast<void>(ProcessGrid::make(8, DecompositionMode::Custom, int64_3d{8, 8, 8}));
   });
 
   expect_invalid_argument([] { static_cast<void>(ProcessGrid::custom(0, 1, 1, 1)); });
