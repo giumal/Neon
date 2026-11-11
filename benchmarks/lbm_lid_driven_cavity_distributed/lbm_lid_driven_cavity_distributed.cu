@@ -250,10 +250,15 @@ parse_cli(int argc,
           char** argv,
           Options& opts) -> bool {
   auto cli = build_cli(opts);
-  if (!clipp::parse(argc, argv, cli) || opts.show_help) {
+  if (!clipp::parse(argc, argv, cli)) {
     auto fmt = clipp::doc_formatting{}.doc_column(31);
     std::cout << clipp::make_man_page(cli, argv[0], fmt) << '\n';
-    return opts.show_help;
+    return false;
+  }
+  if (opts.show_help) {
+    auto fmt = clipp::doc_formatting{}.doc_column(31);
+    std::cout << clipp::make_man_page(cli, argv[0], fmt) << '\n';
+    return false;
   }
   if (opts.n < 4) {
     std::cerr << "lbm_lid_driven_cavity: --n must be >= 4 (got " << opts.n << ")\n";
