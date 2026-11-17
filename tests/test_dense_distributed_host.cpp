@@ -1113,6 +1113,39 @@ part_b_global_validation() -> size_t {
 }
 
 auto
+part_b_zhalo() -> size_t {
+  g_ctx = "part B z-halo";
+  const carbon::Stencil aniso(
+      std::vector<int32_3d>{{2, 0, 0}, {-2, 0, 0}, {0, 0, 1}, {0, 0, -1}},
+      /*remove_center=*/true);
+  CHECK(aniso.radius() == 2);
+  CHECK(aniso.radius3().z == 1);
+  size_t cases = 0;
+  {
+    const ProcessGrid pg = ProcessGrid::custom(4, 1, 1, 4);
+    const int64_3d halo = dd::halo_extent(pg, BoundaryModeDistributed::Open, aniso);
+    CHECK(dd::is_legacy_slab(pg, BoundaryModeDistributed::Open));
+    CHECK(halo.x == 0 && halo.y == 0 && halo.z == 2);
+    ++cases;
+  }
+  {
+    const ProcessGrid pg = ProcessGrid::custom(4, 1, 1, 4);
+    const int64_3d halo = dd::halo_extent(pg, BoundaryModeDistributed::PeriodicX, aniso);
+    CHECK(!dd::is_legacy_slab(pg, BoundaryModeDistributed::PeriodicX));
+    CHECK(halo.x == 2 && halo.y == 0 && halo.z == 1);
+    ++cases;
+  }
+  {
+    const carbon::Stencil iso(six(), /*remove_center=*/true);
+    const ProcessGrid pg = ProcessGrid::custom(2, 1, 1, 2);
+    const int64_3d halo = dd::halo_extent(pg, BoundaryModeDistributed::PeriodicY, iso);
+    CHECK(halo.x == 0 && halo.y == 1 && halo.z == 1);
+    ++cases;
+  }
+  return cases;
+}
+
+auto
 part_b_padded_layout() -> size_t {
   g_ctx = "part B padded layout";
   const carbon::Stencil stencil(six(), /*remove_center=*/true);
@@ -1549,10 +1582,12 @@ main() {
   size_t geom_neighbours = 0;
   const size_t geom_cases = part_b_geometry(geom_cells, geom_neighbours);
   const size_t validation_cases = part_b_global_validation();
+  const size_t zhalo_cases = part_b_zhalo();
   const size_t padded_layout_cases = part_b_padded_layout();
   std::printf("geometry cases=%zu  owned cells checked=%zu  neighbour reads checked=%zu  "
-              "global-validation cases=%zu  padded-layout cases=%zu\n",
-              geom_cases, geom_cells, geom_neighbours, validation_cases, padded_layout_cases);
+              "global-validation cases=%zu  z-halo cases=%zu  padded-layout cases=%zu\n",
+              geom_cases, geom_cells, geom_neighbours, validation_cases, zhalo_cases,
+              padded_layout_cases);
 
   size_t vtk_shards = 0;
   size_t vtk_empty = 0;

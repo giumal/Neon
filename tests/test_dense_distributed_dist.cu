@@ -258,12 +258,27 @@ run_halo_once(carbon::System& sys,
   carbon::HaloDistributed<int, Components> exchange(field, stencil, semantic);
   // A multi-rank layout always needs cross-rank transfers (X/Y faces fan out into several runs, so
   // the exact count is geometry dependent; correctness is enforced by the cell comparison below).
-  if (exchange.pair_count() != 0U || exchange.dist_entry_count() == 0U ||
-      (exchange.dist_entry_count() % 2U) != 0U) {
+  //
+  // Intra-rank pairs: a periodic axis owned by a single rank wraps onto itself. The packed path
+  // carries that wrap inside its gather/scatter kernels (no pair); the run-based path issues
+  // per-run intra copies, and so does the Z axis of a single-component field, which is never
+  // packed. Everything else is cross-rank, so the pair count must be zero.
+  const char* pack_env = std::getenv("CARBON_HALO_PACK");
+  const char* pack_z_env = std::getenv("CARBON_HALO_PACK_Z");
+  const bool packed = pack_env == nullptr || std::string(pack_env) != "0";
+  const bool packed_z = packed && (pack_z_env == nullptr || std::string(pack_z_env) != "0");
+  const int32_3d pdims = pg.dims();
+  const bool self_wrap_pairs =
+      (carbon::is_periodic(mode, Axis::X) && pdims.x == 1 && !packed) ||
+      (carbon::is_periodic(mode, Axis::Y) && pdims.y == 1 && !packed) ||
+      (carbon::is_periodic(mode, Axis::Z) && pdims.z == 1 && !(packed_z && Components > 1));
+  const bool pairs_ok = self_wrap_pairs ? exchange.pair_count() != 0U : exchange.pair_count() == 0U;
+  if (!pairs_ok || exchange.dist_entry_count() == 0U || (exchange.dist_entry_count() % 2U) != 0U) {
     CARBON_LOG_ERROR(
-        "test_dense_distributed_dist[{}]: pair_count={} dist_entry_count={} (want 0 and a "
+        "test_dense_distributed_dist[{}]: pair_count={} dist_entry_count={} (want {} and a "
         "non-zero even count)",
-        label, exchange.pair_count(), exchange.dist_entry_count());
+        label, exchange.pair_count(), exchange.dist_entry_count(),
+        self_wrap_pairs ? "a non-zero self-wrap count" : "0");
     return false;
   }
   try {

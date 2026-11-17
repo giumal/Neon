@@ -1032,13 +1032,12 @@ run_cg(Grid& grid,
   }
   // ---- end VTK dump -----------------------------------------------------
 
-  if (iter == opts.max_iter && world_rank == 0) {
-      CARBON_LOG_INFO("cg_poisson_unified[{}]: halted at max_iter={}, convergence status: {}", 
-                      grid_tag, opts.max_iter, converged);
-      return EXIT_SUCCESS;
+  if (iter == opts.max_iter && !converged && world_rank == 0) {
+    CARBON_LOG_INFO("cg_poisson_unified[{}]: halted at max_iter={}, convergence status: {}",
+                    grid_tag, opts.max_iter, converged);
   }
 
-  return (final_r_norm <= abs_target) ? EXIT_SUCCESS : EXIT_FAILURE;
+  return converged ? EXIT_SUCCESS : EXIT_FAILURE;
 
 }
 

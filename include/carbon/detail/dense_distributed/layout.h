@@ -16,7 +16,9 @@
  * - An axis carries a halo iff it is split (@c P > 1) or periodic; its thickness is the stencil
  *   radius along that axis (@c Stencil::radius3).
  * - Slab layouts (@c Px == Py == 1) keep carbon's historical Z halo: the isotropic
- *   @c Stencil::radius, always present on Z, with X/Y halos only when those axes are periodic.
+ *   @c Stencil::radius for the legacy (non-periodic X/Y) slab, and the Z-axis
+ *   @c Stencil::radius3().z for a slab with periodic X/Y, with X/Y halos only when those
+ *   axes are periodic.
  */
 
 #include <carbon/boundary_mode_distributed.h>
@@ -161,10 +163,13 @@ halo_extent(const ProcessGrid& pg,
   if (is_legacy_slab(pg, boundary)) {
     return int64_3d{0, 0, static_cast<int64_t>(stencil.radius())};
   }
+  // Non-legacy slab (Px == Py == 1 with a periodic X or Y): Z keeps its "always haloed" slab
+  // behaviour but takes the Z-axis radius, not the isotropic max radius (an anisotropic stencil
+  // such as radius (2, 0, 1) needs a Z halo of 1, not 2). The legacy slab above is unchanged.
   return int64_3d{
       axis_halo(radius3.x, dims.x, Axis::X),
       axis_halo(radius3.y, dims.y, Axis::Y),
-      axis_halo(radius3.z, dims.z, Axis::Z),
+      pg.is_slab() ? static_cast<int64_t>(radius3.z) : axis_halo(radius3.z, dims.z, Axis::Z),
   };
 }
 
