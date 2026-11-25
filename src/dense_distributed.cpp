@@ -250,8 +250,7 @@ DenseDistributed::DenseDistributed(System system,
       world_size > 0 ? ProcessGrid::make(world_size, decomposition, global_extent)
                      : ProcessGrid{};
   if (world_size > 0) {
-    const carbon::Distributed* distributed = system.distributed();
-    if (distributed == nullptr || distributed->world_rank() == 0) {
+    if (resolve_world_rank(system) == 0) {
       const int32_3d dims = pg.dims();
       CARBON_LOG_INFO(
           "DenseDistributed: process_grid={}x{}x{} (mode={}, world_size={}, "
